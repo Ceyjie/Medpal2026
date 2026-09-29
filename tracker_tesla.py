@@ -1,38 +1,40 @@
 #!/usr/bin/env python3
 """
-tracker_tesla.py -- SSD MobileNet Face + body ReID + occupancy-grid path planning.
+tracker_tesla.py -- Coral detection + CPU ArcFace + identity lock + A* planner.
 
-Face detection: SSD MobileNet V2 Face on Coral Edge TPU.
-Identity rule:
-  - Body track is the unit of identity.
-  - t.name only changes when det["scanned"] is True (face < FACE_RECOGNIZE_MAX_MM).
-  - A scanned face sets t.name to the recognized name, or "Unknown".
-  - If no face is scanned this frame, t.name is left untouched.
-  - Body signatures accumulate on ANY frame the track has a name and a body
-    embedding is available.
-  - Per-track face scan cooldown: after a track is scanned, the same track
-    will not be scanned again for FACE_SCAN_COOLDOWN_S seconds.
+Architecture:
+  - Coral EdgeTPU: SSD MobileNet V2 Face + SSD MobileNet V2 COCO (person)
+    -> runs every frame at ~10 ms each
+  - CPU: SCRFD 640x640 + ArcFace w600k_mbf
+    -> runs ONLY on scan events (face close enough + past cooldown)
+    -> ~210 ms per scan, amortized
+  - SimpleTracker keeps sticky identity across frames.
 
-Navigation:
-  - Depth image is projected to a top-down occupancy grid (free / occupied).
-  - The tracked person is placed as the goal in grid coordinates.
-  - A* computes the shortest path from the robot (grid center) to that goal.
-  - Steering follows the first few cells of the path (pure-pursuit style).
-  - The path is drawn on the camera view like Tesla's blue line.
+Identity lock:
+  - A scan with confidence >= IDENTITY_LOCK_MIN_CONF locks the track.
+  - Locked tracks are NOT scanned again until they die.
+  - Dying locked tracks with body signatures go into a recently_lost
+    cache. If the same body reappears within REID_MAX_FRAMES, the new
+    track inherits the name and stays locked.
+  - Locked tracks survive scans that return no match (bad frame,
+    angle, occlusion) without losing their name.
+  - Only a track death clears the lock.
+
+Navigation (planner):
+  - Depth image is projected to a top-down occupancy grid.
+  - The tracked person becomes the goal in grid coordinates.
+  - A* computes the shortest path from the robot (grid center).
+  - Steering follows the first few cells of the path (pure pursuit).
+  - Toggle with 'p' at runtime or --no-planner.
 
 Commands:
-    --enroll NAME            Capture face crops for a person
-    --samples N              Crops per enrollment (default 30)
-    --register-only NAME     Remove all others, then enroll only this person
     --follow NAME            Follow only this person
     --list-people            Show enrolled people and classifier state
-    --remove-person NAME     Delete a person's crops
-    --clear-auto NAME        Delete only auto-saved crops for a person
     --test-motors            Drive each wheel briefly
     --no-auto-save           Disable auto-saving for this run
-    --auto-train             Retrain classifier on exit if any crops were saved
+    --auto-train             Retrain classifier on exit if crops were saved
     --no-body-reid           Disable OSNet body ReID (saves CPU)
-    --debug-tracks           Print track signature/revival events
+    --debug-tracks           Print track signature/revival/lock events
     --no-planner             Use reactive steering instead of A* path planning
 
 Runtime controls:
@@ -45,6 +47,11 @@ Runtime controls:
 
 import os
 import sys
+
+os.environ.setdefault("ORT_LOGGING_LEVEL", "3")
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+os.environ["OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"] = "0"
+
 import cv2
 import numpy as np
 import pickle
@@ -55,10 +62,8 @@ import shutil
 import math
 import heapq
 
-os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
-os.environ["OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"] = "0"
-
 sys.path.append('/home/medpal/pyorbbecsdk_v1/build')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat
@@ -99,10 +104,12 @@ except ImportError:
 
 import config
 from serial_motors import SerialMotors
+from scrfd_detector import SCRFDDetector
+from arcface_embedder import ArcFaceEmbedder
 
 
 # ============================================================
-# Camera parameters (defaults, overridden by config if present)
+# Camera parameters
 # ============================================================
 CAMERA_HEIGHT_MM = getattr(config, "CAMERA_HEIGHT_MM", 200)
 CAMERA_TILT_DEG = getattr(config, "CAMERA_TILT_DEG", 15)
@@ -131,24 +138,42 @@ class Camera:
         self.color_frame = None
         self.depth_frame = None
         self.color_running = True
-        self.color_thread = threading.Thread(target=self._color_capture, daemon=True)
+        self.color_thread = threading.Thread(
+            target=self._color_capture, daemon=True)
         self.color_thread.start()
         print("Using cv2.VideoCapture for color")
+
         if USE_ORBBEC_DEPTH:
-            self.depth_pipeline = Pipeline()
-            self.depth_config = Config()
-            profiles = self.depth_pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
             try:
-                self.depth_profile = profiles.get_video_stream_profile(320, 240, OBFormat.Y16, 15)
-            except:
-                self.depth_profile = profiles.get_default_video_stream_profile()
-            self.depth_config.enable_stream(self.depth_profile)
-            self.depth_pipeline.start(self.depth_config)
-            self.depth_running = True
-            self.depth_thread = threading.Thread(target=self._depth_capture, daemon=True)
-            self.depth_thread.start()
-            self.use_orbbec_depth = True
-            print(f"Using Astra for depth ({self.depth_profile.get_width()}x{self.depth_profile.get_height()})")
+                self.depth_pipeline = Pipeline()
+                self.depth_config = Config()
+                profiles = self.depth_pipeline.get_stream_profile_list(
+                    OBSensorType.DEPTH_SENSOR)
+                self.depth_profile = None
+                for w, h, fps in [(320, 240, 15), (320, 240, 30),
+                                  (640, 480, 15)]:
+                    try:
+                        self.depth_profile = profiles.get_video_stream_profile(
+                            w, h, OBFormat.Y16, fps)
+                        print(f"Depth profile: {w}x{h}@{fps}")
+                        break
+                    except Exception:
+                        continue
+                if self.depth_profile is None:
+                    self.depth_profile = profiles.get_default_video_stream_profile()
+                    print(f"Depth profile: default "
+                          f"({self.depth_profile.get_width()}x"
+                          f"{self.depth_profile.get_height()})")
+                self.depth_config.enable_stream(self.depth_profile)
+                self.depth_pipeline.start(self.depth_config)
+                self.depth_running = True
+                self.depth_thread = threading.Thread(
+                    target=self._depth_capture, daemon=True)
+                self.depth_thread.start()
+                self.use_orbbec_depth = True
+            except Exception as e:
+                print(f"Depth pipeline unavailable: {e}")
+                self.use_orbbec_depth = False
         else:
             self.use_orbbec_depth = False
 
@@ -167,8 +192,12 @@ class Camera:
                     df = frames.get_depth_frame()
                     if df:
                         w, h = df.get_width(), df.get_height()
-                        scale = df.get_depth_scale()
-                        data = np.frombuffer(df.get_data(), dtype=np.uint16).reshape(h, w)
+                        try:
+                            scale = df.get_depth_scale()
+                        except AttributeError:
+                            scale = 1.0
+                        data = np.frombuffer(
+                            df.get_data(), dtype=np.uint16).reshape(h, w)
                         depth_mm = data.astype(np.float32) * scale
                         depth_mm[depth_mm < config.MIN_VALID_DEPTH_MM] = 0
                         self.depth_frame = depth_mm
@@ -194,15 +223,17 @@ class Camera:
 
 
 # ============================================================
-# Face Detector -- SSD MobileNet V2 Face on Coral
+# Face Detector (Coral SSD MobileNet V2 Face)
 # ============================================================
 class FaceDetector:
     def __init__(self, model_path, label_path=None):
+        if not PYCORAL_AVAILABLE and not CORAL_AVAILABLE:
+            raise RuntimeError(
+                "FaceDetector needs pycoral or tflite_runtime.")
         self.labels = []
         if label_path and os.path.exists(label_path):
             with open(label_path) as f:
                 self.labels = [l.strip() for l in f.readlines()]
-
         self.mode = None
         self.engine = None
         self.interpreter = None
@@ -220,7 +251,8 @@ class FaceDetector:
 
         if CORAL_EDGETPU:
             delegate = load_delegate('libedgetpu.so.1')
-            self.interpreter = Interpreter(model_path, experimental_delegates=[delegate])
+            self.interpreter = Interpreter(
+                model_path, experimental_delegates=[delegate])
         else:
             cpu_path = model_path.replace('_edgetpu', '')
             self.interpreter = Interpreter(cpu_path)
@@ -244,15 +276,14 @@ class FaceDetector:
         self.engine.invoke()
         h, w = frame.shape[:2]
         sx, sy = w / inp_w, h / inp_h
-        objs = pycoral_detect.get_objects(self.engine,
-                                          score_threshold=config.CONF_THRES)
+        objs = pycoral_detect.get_objects(
+            self.engine, score_threshold=config.CONF_THRES)
         results = []
         self.last_top_score = 0.0
         for obj in objs:
             self.last_top_score = max(self.last_top_score, float(obj.score))
             bbox = obj.bbox
-            x = int(bbox.xmin * sx)
-            y = int(bbox.ymin * sy)
+            x = int(bbox.xmin * sx); y = int(bbox.ymin * sy)
             bw = int((bbox.xmax - bbox.xmin) * sx)
             bh = int((bbox.ymax - bbox.ymin) * sy)
             results.append((x, y, bw, bh, float(obj.score)))
@@ -287,10 +318,13 @@ class FaceDetector:
 
 
 # ============================================================
-# Body Detector (Coral SSD COCO, person class)
+# Body Detector (Coral SSD MobileNet V2 COCO, person class)
 # ============================================================
 class BodyDetector:
     def __init__(self, model_path, label_path=None):
+        if not PYCORAL_AVAILABLE and not CORAL_AVAILABLE:
+            raise RuntimeError(
+                "BodyDetector needs pycoral or tflite_runtime.")
         self.labels = []
         if label_path and os.path.exists(label_path):
             with open(label_path) as f:
@@ -320,7 +354,8 @@ class BodyDetector:
 
         if CORAL_EDGETPU:
             delegate = load_delegate('libedgetpu.so.1')
-            self.interpreter = Interpreter(model_path, experimental_delegates=[delegate])
+            self.interpreter = Interpreter(
+                model_path, experimental_delegates=[delegate])
         else:
             cpu_path = model_path.replace('_edgetpu', '')
             self.interpreter = Interpreter(cpu_path)
@@ -344,7 +379,8 @@ class BodyDetector:
         self.engine.invoke()
         h, w = frame.shape[:2]
         sx, sy = w / inp_w, h / inp_h
-        objs = pycoral_detect.get_objects(self.engine, score_threshold=self.conf_thres)
+        objs = pycoral_detect.get_objects(
+            self.engine, score_threshold=self.conf_thres)
         results = []
         for obj in objs:
             if obj.id != self.PERSON_CLASS:
@@ -390,10 +426,8 @@ class BodyReID:
             raise FileNotFoundError(f"Body ReID model not found: {model_path}")
         if not ONNX_AVAILABLE:
             raise RuntimeError("onnxruntime not installed.")
-
         self.session = ort.InferenceSession(
-            model_path, providers=["CPUExecutionProvider"],
-        )
+            model_path, providers=["CPUExecutionProvider"])
         self.input_name = self.session.get_inputs()[0].name
         shape = self.session.get_inputs()[0].shape
         self.input_h = 256
@@ -419,76 +453,9 @@ class BodyReID:
         try:
             out = self.session.run(None, {self.input_name: img})[0]
         except Exception as e:
-            print(f"BodyReID error: {e}")
+            print(f"BodyReID inference error: {e}")
             return None
         vec = out.flatten().astype(np.float32)
-        norm = np.linalg.norm(vec)
-        return vec / norm if norm > 0 else vec
-
-
-# ============================================================
-# Face Embedder (Coral FaceNet)
-# ============================================================
-class FaceEmbedder:
-    def __init__(self, model_path):
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Face embedding model not found: {model_path}")
-        self.interpreter = None
-        self.input_details = None
-        self.output_details = None
-        self.input_h = 224
-        self.input_w = 224
-        self.embedding_dim = 1024
-        self.input_dtype = np.uint8
-
-        if CORAL_EDGETPU:
-            delegate = load_delegate('libedgetpu.so.1')
-            self.interpreter = Interpreter(model_path, experimental_delegates=[delegate])
-        else:
-            cpu_path = model_path.replace('_edgetpu', '')
-            self.interpreter = Interpreter(cpu_path)
-        self.interpreter.allocate_tensors()
-        self.input_details = self.interpreter.get_input_details()
-        self.output_details = self.interpreter.get_output_details()
-        shape = self.input_details[0]['shape']
-        if len(shape) == 4:
-            h_candidate, w_candidate = int(shape[1]), int(shape[2])
-            if h_candidate >= 32 and w_candidate >= 32:
-                self.input_h, self.input_w = h_candidate, w_candidate
-            elif int(shape[2]) >= 32 and int(shape[3]) >= 32:
-                self.input_h, self.input_w = int(shape[2]), int(shape[3])
-        out_shape = self.output_details[0]['shape']
-        if len(out_shape) > 0:
-            self.embedding_dim = int(out_shape[-1])
-        self.input_dtype = self.input_details[0]['dtype']
-        print(f"FaceEmbedder: input {self.input_w}x{self.input_h} "
-              f"dtype={self.input_dtype.__name__}, output {self.embedding_dim}-D")
-
-    def embed(self, face_crop):
-        h, w = face_crop.shape[:2]
-        if h == 0 or w == 0:
-            return None
-        if w < 96 or h < 96:
-            pad_x = max(0, (96 - w) // 2)
-            pad_y = max(0, (96 - h) // 2)
-            face_crop = cv2.copyMakeBorder(
-                face_crop, pad_y, pad_y, pad_x, pad_x,
-                cv2.BORDER_REFLECT_101,
-            )
-        h2, w2 = face_crop.shape[:2]
-        interp = cv2.INTER_CUBIC if (self.input_w >= w2 and self.input_h >= h2) else cv2.INTER_AREA
-        img = cv2.resize(face_crop, (self.input_w, self.input_h), interpolation=interp)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        if self.input_dtype == np.uint8:
-            img = img.astype(np.uint8)
-        else:
-            img = img.astype(np.float32)
-            img = (img - 127.5) / 128.0
-        img = np.expand_dims(img, axis=0)
-        self.interpreter.set_tensor(self.input_details[0]['index'], img)
-        self.interpreter.invoke()
-        output = self.interpreter.tensor(self.output_details[0]['index'])()
-        vec = output.flatten().astype(np.float32)
         norm = np.linalg.norm(vec)
         if norm > 0:
             vec = vec / norm
@@ -525,14 +492,15 @@ class FaceRecognizer:
             print(f"FaceRecognizer: unexpected type {data.get('model_type')}")
             return
         self.names = list(data["names"])
-        self.centroids = data["centroids"]
-        self.galleries = [np.asarray(g, dtype=np.float32) for g in data["galleries"]]
-        self.stats_p10 = data["stats_p10"]
-        self.stats_p50 = data["stats_p50"]
-        self.stats_p90 = data["stats_p90"]
+        self.centroids = np.asarray(data["centroids"], dtype=np.float32)
+        self.galleries = [np.asarray(g, dtype=np.float32)
+                          for g in data["galleries"]]
+        self.stats_p10 = np.asarray(data["stats_p10"], dtype=np.float32)
+        self.stats_p50 = np.asarray(data["stats_p50"], dtype=np.float32)
+        self.stats_p90 = np.asarray(data["stats_p90"], dtype=np.float32)
         self.available = True
         sizes = [g.shape[0] for g in self.galleries]
-        print(f"FaceRecognizer: loaded for {self.names} (gallery sizes: {sizes})")
+        print(f"FaceRecognizer: loaded for {self.names} (galleries: {sizes})")
 
     def predict(self, embedding, top_k=3):
         if not self.available or embedding is None:
@@ -541,7 +509,8 @@ class FaceRecognizer:
         q = q / (np.linalg.norm(q) + 1e-9)
         best_combined = -1.0
         best_idx = -1
-        for i, (centroid, gallery) in enumerate(zip(self.centroids, self.galleries)):
+        for i, (centroid, gallery) in enumerate(
+                zip(self.centroids, self.galleries)):
             score_cent = float(centroid @ q)
             gallery_sims = gallery @ q
             k = min(top_k, len(gallery_sims))
@@ -611,13 +580,16 @@ class TrackConfirmationCache:
     HOLD_FRAMES = 60
     IOU_THRESH = 0.4
     CACHE_MIN_CONF = 0.85
+
     def __init__(self):
         self.entries = []
+
     def update(self, frame_count, box, name, confidence):
         if name != "Unknown" and confidence >= self.CACHE_MIN_CONF:
             self.entries.append((frame_count, box, name))
         self.entries = [e for e in self.entries
                         if frame_count - e[0] <= self.HOLD_FRAMES]
+
     def confirmed_name_for(self, frame_count, box):
         best_name = None
         best_iou = 0.0
@@ -643,6 +615,7 @@ class AutoSaver:
     VARIETY_SIM_THRESH = 0.90
     RECENT_WINDOW = 20
     MAX_PER_SESSION = 50
+
     def __init__(self, enabled=True):
         self.enabled = enabled
         self.recent = {}
@@ -653,11 +626,13 @@ class AutoSaver:
         self.total_saved = 0
         self.total_direct = 0
         self.total_track = 0
+
     def maybe_save(self, name, face_crop, embedding, confidence,
                    confirmed_by_track=False):
         if not self.enabled or name is None or embedding is None:
             return False
-        min_conf = (self.MIN_CONF_TRACK if confirmed_by_track else self.MIN_CONF_DIRECT)
+        min_conf = (self.MIN_CONF_TRACK if confirmed_by_track
+                    else self.MIN_CONF_DIRECT)
         if confidence < min_conf:
             return False
         h, w = face_crop.shape[:2]
@@ -701,11 +676,14 @@ class AutoSaver:
             else:
                 self.total_direct += 1
                 self.saved_direct[name] = self.saved_direct.get(name, 0) + 1
-            print(f"AUTO-SAVED: {fname}  (conf {confidence:.2f}, "
+            print(f"AUTO-SAVED: {fname}  "
+                  f"(conf {confidence:.2f}, "
                   f"{'track' if confirmed_by_track else 'direct'}, "
-                  f"blur {blur_var:.0f}, session {count + 1}/{self.MAX_PER_SESSION})")
+                  f"blur {blur_var:.0f}, "
+                  f"session {count + 1}/{self.MAX_PER_SESSION})")
             return True
         return False
+
     def summary(self):
         if self.total_saved == 0:
             return
@@ -718,7 +696,7 @@ class AutoSaver:
 
 
 # ============================================================
-# Track + Tracker
+# Track (with identity lock fields)
 # ============================================================
 class Track:
     MAX_SIG = 10
@@ -740,6 +718,11 @@ class Track:
         self.identity_source = "face" if has_face else "none"
         self.last_scan_frame = -999
 
+        # Identity lock
+        self.identity_locked = False
+        self.lock_frame = -1
+        self.lock_source = "none"
+
     def add_signature(self, embedding):
         if embedding is None:
             return False
@@ -755,18 +738,21 @@ class Track:
         return True
 
 
+# ============================================================
+# SimpleTracker with identity lock
+# ============================================================
 class SimpleTracker:
     MIN_MATCH_SCORE = 0.30
     SMOOTH_ALPHA = 0.55
     VEL_ALPHA = 0.5
-    REID_MAX_FRAMES = 60
+    REID_MAX_FRAMES = 240
     REID_MAX_DIST = 150
     BODY_REVIVE_THRESH = 0.90
     SIG_ACCUM_MIN_CONF = 0.85
     SIG_ACCUM_INTERVAL = 5
     UNKNOWN_MAX_LOST = 20
 
-    def __init__(self, max_lost=180, debug=False):
+    def __init__(self, max_lost=600, debug=False):
         self.max_lost = max_lost
         self.debug = debug
         self.tracks = []
@@ -838,16 +824,27 @@ class SimpleTracker:
                     t.confidence = det.get("conf", 0.0)
                     t.identity_fresh = True
                     t.identity_source = "face"
+                    lock_min = getattr(config, "IDENTITY_LOCK_MIN_CONF", 0.85)
+                    if t.confidence >= lock_min and not t.identity_locked:
+                        t.identity_locked = True
+                        t.lock_frame = frame_count
+                        t.lock_source = "face"
+                        if self.debug:
+                            print(f"[track #{t.id}] LOCKED as '{t.name}' "
+                                  f"(conf {t.confidence:.2f})")
                 else:
-                    t.name = "Unknown"
-                    t.confidence = 0.0
-                    t.identity_fresh = False
-                    t.identity_source = "none"
-                    t.body_signatures = []
+                    if not t.identity_locked:
+                        t.name = "Unknown"
+                        t.confidence = 0.0
+                        t.identity_fresh = False
+                        t.identity_source = "none"
+                        t.body_signatures = []
                 t.identity_set_frame = frame_count
             else:
                 t.identity_fresh = False
-                if t.name != "Unknown":
+                if t.identity_locked:
+                    t.identity_source = "face"
+                elif t.name != "Unknown":
                     t.identity_source = "memory"
                 else:
                     t.identity_source = "none"
@@ -871,7 +868,8 @@ class SimpleTracker:
             if di in matched_dets:
                 continue
 
-            if not det.get("scanned", False) and not det.get("face_only_proxy", False):
+            if (not det.get("scanned", False)
+                    and not det.get("face_only_proxy", False)):
                 bx, by, bw, bh = det["box"]
                 if (bw < getattr(config, "MIN_BODY_BOX_W", 60)
                         or bh < getattr(config, "MIN_BODY_BOX_H", 120)
@@ -926,13 +924,25 @@ class SimpleTracker:
             if det.get("scanned", False):
                 t.identity_source = "face" if new_name else "none"
                 t.last_scan_frame = frame_count
+                lock_min = getattr(config, "IDENTITY_LOCK_MIN_CONF", 0.85)
+                if new_name is not None and new_conf >= lock_min:
+                    t.identity_locked = True
+                    t.lock_frame = frame_count
+                    t.lock_source = "face"
+                    if self.debug:
+                        print(f"[new track #{t.id}] LOCKED as '{new_name}' "
+                              f"(conf {new_conf:.2f})")
             elif new_name is not None:
                 t.identity_fresh = False
                 t.body_signatures = list(revived_sigs)
                 t.identity_source = "body"
+                t.identity_locked = True
+                t.lock_frame = frame_count
+                t.lock_source = "body"
                 if self.debug:
-                    print(f"[new track #{t.id}] revived as '{new_name}' "
-                          f"via body ReID ({len(revived_sigs)} sigs)")
+                    print(f"[new track #{t.id}] REVIVED and LOCKED as "
+                          f"'{new_name}' via body ReID "
+                          f"({len(revived_sigs)} sigs)")
 
             if (t.name != "Unknown"
                     and det.get("body_embedding") is not None):
@@ -954,8 +964,9 @@ class SimpleTracker:
                          list(t.body_signatures))
                     )
                     if self.debug:
-                        print(f"[track #{t.id}] died with "
-                              f"{len(t.body_signatures)} body sigs -> cached")
+                        print(f"[track #{t.id}] died "
+                              f"({len(t.body_signatures)} sigs cached, "
+                              f"was_locked={t.identity_locked})")
                 self._last_sig_frame.pop(t.id, None)
         self.tracks = alive
 
@@ -968,7 +979,7 @@ class SimpleTracker:
 
 
 # ============================================================
-# Target Selector
+# Target Selector (prefers locked tracks)
 # ============================================================
 class TargetSelector:
     def __init__(self, follow_name=None):
@@ -977,14 +988,17 @@ class TargetSelector:
         self.locked_since = 0
         self.SWITCH_MARGIN = 0.08
         self.HOLD_FRAMES = 30
+
     def set_name(self, name):
         if name and name != self.follow_name:
             print(f"Target switched to: {name}")
             self.follow_name = name
             self.locked_name = None
             self.locked_since = 0
+
     def choose(self, frame_count, tracks):
-        candidates = [t for t in tracks if t.name != "Unknown" and t.lost == 0]
+        candidates = [t for t in tracks
+                      if t.name != "Unknown" and t.lost == 0]
         if not candidates:
             return None
         if self.follow_name is not None:
@@ -993,6 +1007,10 @@ class TargetSelector:
             if not wanted:
                 return None
             candidates = wanted
+        locked = [t for t in candidates
+                  if getattr(t, "identity_locked", False)]
+        if locked:
+            candidates = locked
         best = max(candidates, key=lambda t: t.confidence)
         if self.locked_name is None:
             self.locked_name = best.name
@@ -1032,8 +1050,8 @@ def get_sector_distances(depth, person_box, depth_w, depth_h):
     third = depth_w // 3
     sectors = {}
     for name, (c1, c2) in [("left", (0, third)),
-                            ("center", (third, 2 * third)),
-                            ("right", (2 * third, depth_w))]:
+                           ("center", (third, 2 * third)),
+                           ("right", (2 * third, depth_w))]:
         region = band[:, c1:c2]
         valid = region[region > 0]
         sectors[name] = float(np.min(valid)) if valid.size > 0 else np.inf
@@ -1048,12 +1066,13 @@ def calculate_speed(distance_mm):
     elif distance_mm < config.FORWARD_DISTANCE_MM:
         return 0
     else:
-        extra = ((distance_mm - config.FORWARD_DISTANCE_MM) // 100) * config.SPEED_INCREASE
+        extra = ((distance_mm - config.FORWARD_DISTANCE_MM) // 100) * \
+                config.SPEED_INCREASE
         return min(config.FOLLOW_BASE_SPEED + extra, config.MAX_SPEED)
 
 
 # ============================================================
-# Steering
+# Steering (reactive)
 # ============================================================
 def compute_steering(bbox, frame_w, frame_h, speed_pct, distance_mm=None,
                      deadband=80):
@@ -1061,14 +1080,11 @@ def compute_steering(bbox, frame_w, frame_h, speed_pct, distance_mm=None,
         return 0, 0
     if bbox is None:
         return 0, 0
-
     x, y, w, h = bbox
     cx = x + w // 2
     frame_cx = frame_w // 2
-
     if abs(cx - frame_cx) <= deadband:
         return int(speed_pct), int(speed_pct)
-
     turn_speed = max(20, int(speed_pct) // 2)
     if cx < frame_cx:
         return -turn_speed, turn_speed
@@ -1089,13 +1105,13 @@ def apply_steering(motors, left, right):
     elif left < 0 and right > 0:
         motors.set_speed(max(-left, right))
         motors.turn_left()
-    else:  # left > 0 and right < 0
+    else:
         motors.set_speed(max(left, -right))
         motors.turn_right()
 
 
 # ============================================================
-# Occupancy grid, A* path planner, path visualisation
+# Occupancy grid + A*
 # ============================================================
 def depth_to_occupancy(depth_mm, grid_size=OCCUPANCY_GRID_SIZE,
                        res_mm=OCCUPANCY_GRID_RES_MM,
@@ -1104,61 +1120,40 @@ def depth_to_occupancy(depth_mm, grid_size=OCCUPANCY_GRID_SIZE,
                        cam_hfov_deg=CAMERA_HFOV_DEG,
                        min_valid_mm=55, max_valid_mm=3000,
                        max_height_mm=1500, step=2):
-    """
-    Project a depth image to a top-down occupancy grid.
-
-    grid values: 0 = free, 1 = occupied, 255 = unknown.
-    Returns (grid, origin_row_col) where origin is the cell of the robot
-    (grid center).
-    """
     if depth_mm is None:
         return None, None
-
     h, w = depth_mm.shape[:2]
     cx_img = w / 2.0
     cy_img = h / 2.0
-
     hfov_rad = math.radians(cam_hfov_deg)
     vfov_rad = hfov_rad * (h / w)
     fx = (w / 2.0) / math.tan(hfov_rad / 2.0)
     fy = (h / 2.0) / math.tan(vfov_rad / 2.0)
-
     tilt_rad = math.radians(cam_tilt_deg)
     c_t = math.cos(-tilt_rad)
     s_t = math.sin(-tilt_rad)
-
     grid = np.full((grid_size, grid_size), 255, dtype=np.uint8)
     origin = (grid_size // 2, grid_size // 2)
-
-    # Mark the robot's own cell as free
-    grid[origin] = 0
+    r0, c0 = origin
+    grid[max(0, r0 - 2):r0 + 3, max(0, c0 - 2):c0 + 3] = 0
 
     for y in range(0, h, step):
         for x in range(0, w, step):
             z = float(depth_mm[y, x])
             if z < min_valid_mm or z > max_valid_mm:
                 continue
-
-            # Ray in camera frame (X right, Y down, Z forward)
             x_cam = (x - cx_img) * z / fx
             y_cam = (y - cy_img) * z / fy
             z_cam = z
-
-            # Rotate to level frame (undo tilt)
             y_rot = c_t * y_cam - s_t * z_cam
             z_rot = s_t * y_cam + c_t * z_cam
-
-            # Height above floor and forward distance
             y_world = y_rot + cam_height_mm
             forward_mm = z_rot
-
             if y_world < 0 or y_world > max_height_mm:
                 continue
             if forward_mm < 100 or forward_mm > max_valid_mm:
                 continue
-
             lateral_mm = x_cam
-
             col = origin[0] + int(lateral_mm / res_mm)
             row = origin[1] - int(forward_mm / res_mm)
             if 0 <= col < grid_size and 0 <= row < grid_size:
@@ -1167,22 +1162,16 @@ def depth_to_occupancy(depth_mm, grid_size=OCCUPANCY_GRID_SIZE,
                         r2, c2 = row + dy, col + dx
                         if 0 <= r2 < grid_size and 0 <= c2 < grid_size:
                             grid[r2, c2] = 1
-
-    # Mark the target's own body as free (so the goal cell isn't blocked)
-    grid[origin] = 0
+    grid[max(0, r0 - 2):r0 + 3, max(0, c0 - 2):c0 + 3] = 0
     return grid, origin
 
 
 def astar(grid, start, goal):
-    """A* on the occupancy grid (8-connected). Returns list of (row, col)."""
     H, W = grid.shape
     sr, sc = start
     gr, gc = goal
-
     if not (0 <= gr < H and 0 <= gc < W):
         return []
-
-    # If the goal is occupied, try the nearest free cell
     if grid[gr, gc] == 1:
         found = False
         for radius in range(1, 8):
@@ -1207,7 +1196,6 @@ def astar(grid, start, goal):
     came_from = {}
     g_score = {(sr, sc): 0.0}
     visited = set()
-
     while open_set:
         _, g, current = heapq.heappop(open_set)
         if current == (gr, gc):
@@ -1217,11 +1205,9 @@ def astar(grid, start, goal):
                 path.append(current)
             path.reverse()
             return path
-
         if current in visited:
             continue
         visited.add(current)
-
         cr, cc = current
         for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1),
                        (-1, -1), (-1, 1), (1, -1), (1, 1)]:
@@ -1235,16 +1221,12 @@ def astar(grid, start, goal):
             if (nr, nc) not in g_score or tentative < g_score[(nr, nc)]:
                 g_score[(nr, nc)] = tentative
                 came_from[(nr, nc)] = current
-                heapq.heappush(open_set, (tentative + h(nr, nc), tentative, (nr, nc)))
-
+                heapq.heappush(open_set,
+                               (tentative + h(nr, nc), tentative, (nr, nc)))
     return []
 
 
 def path_to_steering(path, origin, res_mm, lookahead_cells=6):
-    """
-    Return (lateral_mm, forward_mm) of a lookahead point on the path,
-    relative to the robot at (0, 0).
-    """
     if not path or len(path) < 2:
         return None
     idx = min(lookahead_cells, len(path) - 1)
@@ -1255,15 +1237,12 @@ def path_to_steering(path, origin, res_mm, lookahead_cells=6):
 
 
 def draw_occupancy_overlay(frame, grid, origin, path, res_mm):
-    """Draw top-down map + path in the top-right corner."""
     if grid is None:
         return frame
-
     overlay_h = 200
     overlay_w = 200
     gs = grid.shape[0]
     cell_px = max(2, overlay_w // gs)
-
     panel = np.full((overlay_h, overlay_w, 3), 30, dtype=np.uint8)
     for r in range(gs):
         for c in range(gs):
@@ -1278,20 +1257,15 @@ def draw_occupancy_overlay(frame, grid, origin, path, res_mm):
                 color = (25, 25, 25)
             cv2.rectangle(panel, (x0, y0), (x0 + cell_px, y0 + cell_px),
                           color, -1)
-
-    # Robot dot
     cx = origin[0] * cell_px + cell_px // 2
     cy = origin[1] * cell_px + cell_px // 2
     cv2.circle(panel, (cx, cy), 4, (0, 255, 0), -1)
-
-    # Path polyline
     for i in range(len(path) - 1):
         r1, c1 = path[i]
         r2, c2 = path[i + 1]
         p1 = (c1 * cell_px + cell_px // 2, r1 * cell_px + cell_px // 2)
         p2 = (c2 * cell_px + cell_px // 2, r2 * cell_px + cell_px // 2)
         cv2.line(panel, p1, p2, (255, 120, 0), 2)
-
     fh, fw = frame.shape[:2]
     x_off = fw - overlay_w - 10
     y_off = 10
@@ -1300,7 +1274,6 @@ def draw_occupancy_overlay(frame, grid, origin, path, res_mm):
 
 
 def draw_path_on_frame(frame, path, origin, res_mm, fx, fy):
-    """Project the top-down path back onto the camera image."""
     if not path or fx is None or fy is None:
         return frame
     h, w = frame.shape[:2]
@@ -1309,15 +1282,12 @@ def draw_path_on_frame(frame, path, origin, res_mm, fx, fy):
     tilt_rad = math.radians(CAMERA_TILT_DEG)
     c_t = math.cos(tilt_rad)
     s_t = math.sin(tilt_rad)
-
     pts = []
     for (r, c) in path:
         lateral_mm = (c - origin[0]) * res_mm
         forward_mm = (origin[1] - r) * res_mm
         if forward_mm <= 100:
             continue
-        # World point at floor level (Y = -cam_height_mm in camera frame)
-        # Invert the depth rotation to get camera-frame coords
         z_cam = forward_mm * c_t + (-CAMERA_HEIGHT_MM) * s_t
         y_cam = -forward_mm * s_t + (-CAMERA_HEIGHT_MM) * c_t
         if z_cam <= 50:
@@ -1326,7 +1296,6 @@ def draw_path_on_frame(frame, path, origin, res_mm, fx, fy):
         py = cy_img + y_cam * fy / z_cam
         if 0 <= px < w and 0 <= py < h:
             pts.append((int(px), int(py)))
-
     for i in range(len(pts) - 1):
         cv2.line(frame, pts[i], pts[i + 1], (255, 120, 0), 2)
     return frame
@@ -1349,12 +1318,10 @@ def run_enrollment(cam, face_detector, person_name, target_count):
     print(f"  Output directory: {person_dir}")
     print(f"  Existing crops:   {start_index}")
     print(f"  Will capture:     {target_count}")
-    print(f"  Press 'q' to stop early.\n")
     captured = 0
     attempts = 0
     max_attempts = target_count * 40
     last_saved_gray = None
-    no_face_frames = 0
     cv2.namedWindow("Enrollment", cv2.WINDOW_NORMAL)
     try:
         while captured < target_count and attempts < max_attempts:
@@ -1367,9 +1334,6 @@ def run_enrollment(cam, face_detector, person_name, target_count):
             best = None
             if faces:
                 best = max(faces, key=lambda f: f[2] * f[3])
-            status_color = (0, 0, 255)
-            status_text = "No face detected"
-            saved_this_frame = False
             if best is not None:
                 x, y, w, h, conf = best
                 x = max(0, x); y = max(0, y)
@@ -1378,61 +1342,28 @@ def run_enrollment(cam, face_detector, person_name, target_count):
                 face_crop = frame[y:y2, x:x2]
                 if face_crop.size == 0:
                     continue
-                ok_size = w >= config.ENROLL_MIN_FACE_PX and h >= config.ENROLL_MIN_FACE_PX
                 gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
                 blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-                ok_blur = blur_var >= config.ENROLL_BLUR_THRES
-                ok_diverse = True
-                if last_saved_gray is not None:
-                    try:
-                        resized = cv2.resize(gray, (64, 64))
-                        diff = float(np.mean(np.abs(
-                            resized.astype(np.float32) - last_saved_gray.astype(np.float32)
-                        )))
-                        ok_diverse = diff >= config.ENROLL_DIVERSITY_PX
-                    except Exception:
-                        ok_diverse = True
-                if ok_size and ok_blur and ok_diverse:
-                    fname = os.path.join(person_dir, f"enroll_{start_index + captured:04d}.jpg")
+                ok = (w >= config.ENROLL_MIN_FACE_PX
+                      and h >= config.ENROLL_MIN_FACE_PX
+                      and blur_var >= config.ENROLL_BLUR_THRES)
+                if ok:
+                    fname = os.path.join(
+                        person_dir,
+                        f"enroll_{start_index + captured:04d}.jpg")
                     cv2.imwrite(fname, face_crop)
                     last_saved_gray = cv2.resize(gray, (64, 64))
                     captured += 1
-                    saved_this_frame = True
-                    status_color = (0, 255, 0)
-                    status_text = f"Captured {captured}/{target_count} (blur {blur_var:.0f})"
-                    print(f"  Captured {captured}/{target_count}  [size {w}x{h}, blur {blur_var:.0f}]")
-                else:
-                    reasons = []
-                    if not ok_size: reasons.append(f"too small ({w}x{h})")
-                    if not ok_blur: reasons.append(f"blurry ({blur_var:.0f})")
-                    if not ok_diverse: reasons.append("too similar to last")
-                    status_color = (0, 200, 255)
-                    status_text = "Skipped: " + ", ".join(reasons)
-                box_color = (0, 255, 0) if saved_this_frame else (0, 200, 255)
-                cv2.rectangle(frame, (x, y), (x + w, y + h), box_color, 2)
-            else:
-                no_face_frames += 1
-            cv2.putText(frame, f"Enroll: {person_name}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(frame, status_text, (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
-            cv2.putText(frame, f"Progress: {captured}/{target_count}",
-                        (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            if no_face_frames > 30:
-                cv2.putText(frame, "Move closer / improve lighting",
-                            (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+                    print(f"  Captured {captured}/{target_count}  "
+                          f"[size {w}x{h}, blur {blur_var:.0f}]")
             cv2.imshow("Enrollment", frame)
             if cv2.waitKey(10) & 0xFF == ord('q'):
                 break
     finally:
         cv2.destroyAllWindows()
-    print(f"\nEnrollment finished: {captured} new crops saved to {person_dir}")
-    print(f"Total crops for '{person_name}': {start_index + captured}")
+    print(f"\nEnrollment finished: {captured} crops saved to {person_dir}")
 
 
-# ============================================================
-# Listing / Removal
-# ============================================================
 def run_list_people():
     train_dir = config.FACE_TRAINING_DIR
     svm_path = config.SVM_MODEL_PATH
@@ -1441,15 +1372,11 @@ def run_list_people():
         try:
             with open(svm_path, "rb") as f:
                 data = pickle.load(f)
-            model_type = data.get("model_type", "unknown")
             trained_names = list(data.get("names", []))
             print(f"Trained classifier: {svm_path}")
-            print(f"  Model type: {model_type}")
-            print(f"  Classes:    {trained_names}")
+            print(f"  Classes: {trained_names}")
         except Exception as e:
-            print(f"Trained classifier exists but could not be read: {e}")
-    else:
-        print(f"No trained classifier yet (expected at {svm_path})")
+            print(f"Could not read classifier: {e}")
     print()
     if not os.path.isdir(train_dir):
         print(f"No training directory at {train_dir}")
@@ -1463,16 +1390,9 @@ def run_list_people():
     for idx, p in enumerate(people, start=1):
         all_crops = [f for f in os.listdir(os.path.join(train_dir, p))
                      if f.lower().endswith((".jpg", ".png", ".jpeg"))]
-        enroll_crops = [f for f in all_crops if f.startswith("enroll_")]
-        auto_direct = [f for f in all_crops if f.startswith("auto_dir_")]
-        auto_track = [f for f in all_crops if f.startswith("auto_trk_")]
-        other = len(all_crops) - len(enroll_crops) - len(auto_direct) - len(auto_track)
         marker = "  [trained]" if p in trained_names else ""
-        print(f"  [{idx}] {p:20s} {len(all_crops):4d} crops "
-              f"({len(enroll_crops)} enroll, {len(auto_direct)} auto_dir, "
-              f"{len(auto_track)} auto_trk"
-              + (f", {other} other" if other > 0 else "") + f"){marker}")
-    print("\nUse --follow NAME to select one, or press 1..9 at runtime.")
+        print(f"  [{idx}] {p:20s} {len(all_crops):4d} crops{marker}")
+    print("\nUse --follow NAME to select one.")
 
 
 def run_remove_person(name, delete_auto=False):
@@ -1483,24 +1403,19 @@ def run_remove_person(name, delete_auto=False):
         return
     crops = [f for f in os.listdir(person_dir)
              if f.lower().endswith((".jpg", ".png", ".jpeg"))]
-    auto_crops = [f for f in crops if f.startswith("auto_")]
-    enroll_crops = [f for f in crops if not f.startswith("auto_")]
-    if delete_auto and enroll_crops:
+    if delete_auto:
+        auto_crops = [f for f in crops if f.startswith(("auto_", "live_"))]
         for f in auto_crops:
             os.remove(os.path.join(person_dir, f))
         print(f"Removed {len(auto_crops)} auto-saved crops for '{name}'.")
-        print(f"Kept {len(enroll_crops)} enrollment crops.")
         return
-    print(f"Removing '{name}': {len(crops)} crops from {person_dir}")
+    print(f"Removing '{name}': {len(crops)} crops")
     shutil.rmtree(person_dir)
     remaining = [d for d in os.listdir(config.FACE_TRAINING_DIR)
                  if os.path.isdir(os.path.join(config.FACE_TRAINING_DIR, d))]
-    if not remaining:
-        if os.path.exists(config.SVM_MODEL_PATH):
-            os.remove(config.SVM_MODEL_PATH)
-            print("No people left; removed the stale classifier as well.")
-    else:
-        print(f"Remaining people: {remaining}")
+    if not remaining and os.path.exists(config.SVM_MODEL_PATH):
+        os.remove(config.SVM_MODEL_PATH)
+        print("Removed stale classifier (no people left).")
 
 
 # ============================================================
@@ -1509,7 +1424,8 @@ def run_remove_person(name, delete_auto=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--enroll", metavar="NAME")
-    parser.add_argument("--samples", type=int, default=config.ENROLL_DEFAULT_COUNT)
+    parser.add_argument("--samples", type=int,
+                        default=config.ENROLL_DEFAULT_COUNT)
     parser.add_argument("--register-only", metavar="NAME")
     parser.add_argument("--follow", metavar="NAME")
     parser.add_argument("--list-people", action="store_true")
@@ -1541,19 +1457,17 @@ def main():
                 full = os.path.join(train_dir, d)
                 if os.path.isdir(full):
                     shutil.rmtree(full)
-                    print(f"Removed existing enrollment: {d}")
         if os.path.exists(config.SVM_MODEL_PATH):
             os.remove(config.SVM_MODEL_PATH)
-            print("Removed old classifier.")
         args.enroll = args.register_only
 
     planner_on = not args.no_planner
 
     cam = Camera()
     face_detector = FaceDetector(config.CORAL_FACE_DETECTION_MODEL,
-                                  config.CORAL_FACE_LABELS)
+                                 config.CORAL_FACE_LABELS)
     body_detector = BodyDetector(config.CORAL_DETECTION_MODEL,
-                                  config.CORAL_LABELS)
+                                 config.CORAL_LABELS)
 
     if args.enroll:
         run_enrollment(cam, face_detector, args.enroll, args.samples)
@@ -1561,13 +1475,25 @@ def main():
         return
     if args.test_motors:
         motors = SerialMotors()
-        motors.test_motors()
-        try: motors.cleanup()
-        except Exception: pass
+        try:
+            motors.test_motors()
+        except AttributeError:
+            print("SerialMotors has no test_motors method")
+        try:
+            motors.cleanup()
+        except Exception:
+            pass
         cam.stop()
         return
 
-    face_embedder = FaceEmbedder(config.MOBILEFACENET_MODEL)
+    # --- CPU recognition ---
+    arcface = ArcFaceEmbedder(config.ARCFACE_MODEL_PATH)
+    scrfd = SCRFDDetector(
+        config.SCRFD_MODEL_PATH,
+        input_size=config.SCRFD_INPUT_SIZE,
+        conf_thres=config.SCRFD_CONF_THRES,
+        iou_thres=config.SCRFD_IOU_THRES,
+    )
     face_recognizer = FaceRecognizer(config.SVM_MODEL_PATH)
 
     body_reid = None
@@ -1577,10 +1503,7 @@ def main():
         except Exception as e:
             print(f"Body ReID disabled: {e}")
             body_reid = None
-    if body_reid is None:
-        print("Body ReID: DISABLED")
-    else:
-        print("Body ReID: ENABLED")
+    print(f"Body ReID: {'ENABLED' if body_reid else 'DISABLED'}")
 
     follow_name = args.follow.strip() if args.follow else None
     if not face_recognizer.available or not face_recognizer.names:
@@ -1595,7 +1518,8 @@ def main():
             print(f"\nEnrolled people: {face_recognizer.names}")
             if sys.stdin.isatty():
                 while True:
-                    pick = input("Enter name to follow (or 'q' to quit): ").strip()
+                    pick = input("Enter name to follow "
+                                 "(or 'q' to quit): ").strip()
                     if pick.casefold() == 'q':
                         cam.stop()
                         return
@@ -1603,12 +1527,10 @@ def main():
                                if n.casefold() == pick.casefold()]
                     if matches:
                         follow_name = matches[0]
-                        print(f"Following '{follow_name}'.")
                         break
                     print(f"'{pick}' is not enrolled. Try again.")
             else:
                 follow_name = face_recognizer.names[0]
-                print(f"Non-interactive: defaulting to '{follow_name}'.")
     else:
         matches = [n for n in face_recognizer.names
                    if n.casefold() == follow_name.casefold()]
@@ -1617,7 +1539,6 @@ def main():
             cam.stop()
             return
         follow_name = matches[0]
-        print(f"Following '{follow_name}' (from --follow).")
 
     selector = TargetSelector(follow_name=follow_name)
     auto_save_enabled = (getattr(config, "AUTO_SAVE_RECOGNIZED_CROPS", True)
@@ -1625,45 +1546,39 @@ def main():
     auto_saver = AutoSaver(enabled=auto_save_enabled)
     motors = SerialMotors()
 
-    tracker = SimpleTracker(max_lost=180, debug=args.debug_tracks)
+    tracker = SimpleTracker(max_lost=600, debug=args.debug_tracks)
     following = False
     last_drive_status = None
     frame_interval = 0.12
     frame_count = 0
     track_cache = TrackConfirmationCache()
 
-    # Planner state
     cached_path = []
     cached_grid = None
     cached_origin = None
     plan_every = 3
 
-    # Camera intrinsics for reprojection
     _hfov = math.radians(CAMERA_HFOV_DEG)
     _vfov = _hfov * (config.FRAME_H / config.FRAME_W)
     cam_fx = (config.FRAME_W / 2.0) / math.tan(_hfov / 2.0)
     cam_fy = (config.FRAME_H / 2.0) / math.tan(_vfov / 2.0)
 
-    face_max_mm = getattr(config, "FACE_RECOGNIZE_MAX_MM", 80)
-    scan_cooldown_s = getattr(config, "FACE_SCAN_COOLDOWN_S", 5.0)
+    face_max_mm = getattr(config, "FACE_RECOGNIZE_MAX_MM", 1200)
+    scan_cooldown_s = getattr(config, "FACE_SCAN_COOLDOWN_S", 2.0)
     scan_cooldown_frames = int(scan_cooldown_s * 8)
+    lock_min_conf = getattr(config, "IDENTITY_LOCK_MIN_CONF", 0.85)
     min_body_w = getattr(config, "MIN_BODY_BOX_W", 60)
     min_body_h = getattr(config, "MIN_BODY_BOX_H", 120)
     min_body_area = getattr(config, "MIN_BODY_BOX_AREA", 10000)
 
-    print(f"\nRunning. Currently following: {selector.follow_name}")
-    print("Controls: q=quit, f=follow, s=stop, 1..9=switch target, p=toggle planner")
+    print(f"\nRunning. Following: {selector.follow_name}")
+    print("Controls: q=quit, f=follow, s=stop, 1..9=switch, p=planner")
     print(f"Planner: {'ON' if planner_on else 'OFF'}")
-    print(f"Auto-save: {'ON' if auto_save_enabled else 'OFF'}")
-    print(f"Face scan gate: only faces closer than {face_max_mm} mm")
-    print(f"Face scan cooldown: {scan_cooldown_s:.1f} s per track")
-    print(f"Body min box: {min_body_w}x{min_body_h}, area >= {min_body_area}")
-    print(f"Occupancy grid: {OCCUPANCY_GRID_SIZE}x{OCCUPANCY_GRID_SIZE} "
-          f"@ {OCCUPANCY_GRID_RES_MM} mm/cell")
-    if args.auto_train:
-        print("Auto-train: ON")
-    if args.debug_tracks:
-        print("Track debug: ON")
+    print(f"Face scan gate: {face_max_mm} mm, "
+          f"cooldown {scan_cooldown_s:.1f} s")
+    print(f"Identity lock at conf >= {lock_min_conf:.2f}")
+    print(f"Body min box: {min_body_w}x{min_body_h}, "
+          f"area >= {min_body_area}")
     cv2.namedWindow("MedPal Tracker (Tesla)", cv2.WINDOW_NORMAL)
 
     try:
@@ -1676,7 +1591,7 @@ def main():
                 continue
             depth = cam.read_depth()
 
-            # 1. Face detection + classification
+            # 1. Coral detection
             faces = face_detector.infer(frame)
             bodies_raw = body_detector.infer(frame)
 
@@ -1686,6 +1601,7 @@ def main():
                         and bw * bh >= min_body_area):
                     bodies.append((bx, by, bw, bh, bconf))
 
+            # 2. Scan faces (skipping locked tracks)
             face_recs = []
             for (fx, fy, fw, fh, fconf) in faces:
                 fx = max(0, fx); fy = max(0, fy)
@@ -1712,13 +1628,13 @@ def main():
 
                 too_far = (face_depth_mm is not None
                            and face_depth_mm > face_max_mm)
-
                 if too_far:
                     face_recs.append({
                         "box": (fx, fy, fx2 - fx, fy2 - fy),
                         "name": None, "conf": 0.0, "embedding": None,
                         "crop": face_crop, "depth_mm": face_depth_mm,
-                        "skipped": True, "scanned": False, "in_cooldown": False,
+                        "skipped": True, "scanned": False,
+                        "in_cooldown": False,
                     })
                     continue
 
@@ -1728,7 +1644,11 @@ def main():
                 for tr in tracker.tracks:
                     tx, ty, tw, th = tr.box
                     if tx <= face_cx <= tx + tw and ty <= face_cy <= ty + th:
-                        frames_since = frame_count - getattr(tr, "last_scan_frame", -999)
+                        if getattr(tr, "identity_locked", False):
+                            in_cooldown = True
+                            break
+                        frames_since = frame_count - getattr(
+                            tr, "last_scan_frame", -999)
                         if frames_since < scan_cooldown_frames:
                             in_cooldown = True
                             break
@@ -1738,12 +1658,32 @@ def main():
                         "box": (fx, fy, fx2 - fx, fy2 - fy),
                         "name": None, "conf": 0.0, "embedding": None,
                         "crop": face_crop, "depth_mm": face_depth_mm,
-                        "skipped": True, "scanned": False, "in_cooldown": True,
+                        "skipped": True, "scanned": False,
+                        "in_cooldown": True,
                     })
                     continue
 
-                embedding = face_embedder.embed(face_crop)
-                name, svm_conf = face_recognizer.predict(embedding)
+                # Passed both gates -> scan with SCRFD + ArcFace
+                embedding = None
+                name = None
+                svm_conf = 0.0
+
+                dets = scrfd.infer(frame)
+                if dets:
+                    _, _, _, _, _, lm_frame = max(
+                        dets, key=lambda d: d[2] * d[3])
+                    lm_crop = lm_frame.copy().astype(np.float32)
+                    lm_crop[:, 0] -= fx
+                    lm_crop[:, 1] -= fy
+                    try:
+                        embedding = arcface.embed(
+                            face_crop, landmarks=lm_crop)
+                    except ValueError as e:
+                        print(f"  scan skipped: {e}")
+                        embedding = None
+                    if embedding is not None:
+                        name, svm_conf = face_recognizer.predict(embedding)
+
                 face_recs.append({
                     "box": (fx, fy, fx2 - fx, fy2 - fy),
                     "name": name, "conf": svm_conf, "embedding": embedding,
@@ -1751,7 +1691,7 @@ def main():
                     "skipped": False, "scanned": True, "in_cooldown": False,
                 })
 
-            # 2. Body ReID embeddings
+            # 3. Body ReID
             body_embs = []
             if body_reid is not None:
                 for (bx, by, bw, bh, bconf) in bodies:
@@ -1759,12 +1699,13 @@ def main():
                     bx2 = min(frame.shape[1], bx + bw)
                     by2 = min(frame.shape[0], by + bh)
                     body_crop = frame[by:by2, bx:bx2]
-                    emb = body_reid.embed(body_crop) if body_crop.size > 0 else None
+                    emb = (body_reid.embed(body_crop)
+                           if body_crop.size > 0 else None)
                     body_embs.append(emb)
             else:
                 body_embs = [None] * len(bodies)
 
-            # 3. Associate faces with bodies
+            # 4. Associate faces with bodies
             detections = []
             used_faces = set()
             for i, (bx, by, bw, bh, bconf) in enumerate(bodies):
@@ -1793,7 +1734,8 @@ def main():
                     detections.append({
                         "box": body_box,
                         "name": fr["name"], "conf": fr["conf"],
-                        "has_face": True, "scanned": fr.get("scanned", False),
+                        "has_face": True,
+                        "scanned": fr.get("scanned", False),
                         "face_box": fr["box"], "face_crop": fr["crop"],
                         "embedding": fr["embedding"],
                         "body_embedding": body_embs[i],
@@ -1804,7 +1746,8 @@ def main():
                         "box": body_box,
                         "name": None, "conf": 0.0,
                         "has_face": False, "scanned": False,
-                        "face_box": None, "face_crop": None, "embedding": None,
+                        "face_box": None, "face_crop": None,
+                        "embedding": None,
                         "body_embedding": body_embs[i],
                         "face_only_proxy": False,
                     })
@@ -1828,31 +1771,35 @@ def main():
                     "body_embedding": None, "face_only_proxy": True,
                 })
 
-            # 4. Tracker update
+            # 5. Tracker update
             tracks = tracker.update(detections, frame_count)
 
-            # 5. Auto-save
+            # 6. Auto-save
             for det in detections:
                 if (det["has_face"] and det.get("scanned", False)
                         and det["name"] is not None
                         and det["embedding"] is not None):
-                    face_recognizer.update_gallery(det["name"], det["embedding"], det["conf"])
+                    face_recognizer.update_gallery(
+                        det["name"], det["embedding"], det["conf"])
                     confirmed_by_track = (
-                        track_cache.confirmed_name_for(frame_count, det["box"]) == det["name"]
+                        track_cache.confirmed_name_for(
+                            frame_count, det["box"]) == det["name"]
                     )
                     auto_saver.maybe_save(
-                        det["name"], det["face_crop"], det["embedding"], det["conf"],
+                        det["name"], det["face_crop"],
+                        det["embedding"], det["conf"],
                         confirmed_by_track=confirmed_by_track,
                     )
-                    track_cache.update(frame_count, det["box"], det["name"], det["conf"])
+                    track_cache.update(frame_count, det["box"],
+                                        det["name"], det["conf"])
 
-            # 6. Target selection
+            # 7. Target selection
             best_track = selector.choose(frame_count, tracks)
             best_box = best_track.box if best_track else None
             person_cx = (best_box[0] + best_box[2] // 2) if best_box else None
             person_cy = (best_box[1] + best_box[3] // 2) if best_box else None
 
-            # 7. Depth at target
+            # 8. Depth at target
             target_distance_mm = None
             if best_box is not None and depth is not None:
                 dh, dw = depth.shape[:2]
@@ -1867,17 +1814,18 @@ def main():
                     valid = roi[roi > 0]
                     if valid.size > 0:
                         target_distance_mm = float(np.median(valid))
-                    else:
-                        target_distance_mm = float(depth[dcy, dcx])
 
-            # 8. Obstacle sectors (reactive fallback)
+            # 9. Obstacle sectors
             if depth is not None:
                 _dh, _dw = depth.shape[:2]
-                obstacle_sectors = get_sector_distances(depth, best_box, _dw, _dh)
+                obstacle_sectors = get_sector_distances(
+                    depth, best_box, _dw, _dh)
             else:
-                obstacle_sectors = {"left": np.inf, "center": np.inf, "right": np.inf}
+                obstacle_sectors = {"left": np.inf,
+                                    "center": np.inf,
+                                    "right": np.inf}
 
-            # 9. Path planning (every `plan_every` frames)
+            # 10. Path planning
             if planner_on and depth is not None and frame_count % plan_every == 0:
                 grid, origin = depth_to_occupancy(depth)
                 if grid is not None:
@@ -1887,30 +1835,31 @@ def main():
                         target_fwd = min(target_distance_mm, 2500)
                         target_lat = 0
                         if person_cx is not None:
-                            target_lat = int((person_cx - config.FRAME_W / 2)
-                                             * target_fwd / cam_fx)
-                        goal_col = origin[0] + int(target_lat / OCCUPANCY_GRID_RES_MM)
-                        goal_row = origin[1] - int(target_fwd / OCCUPANCY_GRID_RES_MM)
+                            target_lat = int(
+                                (person_cx - config.FRAME_W / 2)
+                                * target_fwd / cam_fx)
+                        goal_col = origin[0] + int(
+                            target_lat / OCCUPANCY_GRID_RES_MM)
+                        goal_row = origin[1] - int(
+                            target_fwd / OCCUPANCY_GRID_RES_MM)
                         goal_col = max(0, min(grid.shape[1] - 1, goal_col))
                         goal_row = max(0, min(grid.shape[0] - 1, goal_row))
                         cached_path = astar(grid, origin, (goal_row, goal_col))
                     else:
                         cached_path = []
 
-            # 10. Motor control
+            # 11. Motor control
             frame_cx = config.FRAME_W // 2
             cx = person_cx
 
             if following:
                 if best_box is None:
-                    if last_drive_status != "no_target":
-                        print(f"STATUS: {selector.follow_name} not visible.")
                     last_drive_status = "no_target"
                     motors.stop()
                 elif planner_on and cached_path:
-                    result = path_to_steering(cached_path, cached_origin,
-                                              OCCUPANCY_GRID_RES_MM,
-                                              lookahead_cells=6)
+                    result = path_to_steering(
+                        cached_path, cached_origin,
+                        OCCUPANCY_GRID_RES_MM, lookahead_cells=6)
                     if result is None:
                         motors.stop()
                         last_drive_status = "no_path"
@@ -1933,22 +1882,13 @@ def main():
                             motors.forward()
                             last_drive_status = f"path_fwd ({fwd_mm:.0f}mm, {speed}%)"
                 else:
-                    # Reactive fallback
                     if obstacle_sectors["center"] < config.OBSTACLE_STOP_MM:
-                        if last_drive_status != "obstacle_stop":
-                            print(f"STATUS: Obstacle ahead "
-                                  f"({obstacle_sectors['center']:.0f} mm).")
                         last_drive_status = "obstacle_stop"
                         motors.stop()
                     elif target_distance_mm is None:
-                        if last_drive_status != "no_depth":
-                            print("STATUS: No depth data. Stopped.")
                         last_drive_status = "no_depth"
                         motors.stop()
                     elif target_distance_mm < config.REVERSE_DISTANCE_MM:
-                        if last_drive_status != "reversing":
-                            print(f"STATUS: Target too close "
-                                  f"({target_distance_mm:.0f} mm). Reversing.")
                         last_drive_status = "reversing"
                         motors.set_speed(config.REVERSE_SPEED)
                         motors.backward()
@@ -1961,9 +1901,10 @@ def main():
                         speed_pct = (config.FOLLOW_BASE_SPEED
                                      if target_distance_mm < config.FORWARD_DISTANCE_MM
                                      else calculate_speed(target_distance_mm))
-                        distance_for_steering = (None
-                                                 if target_distance_mm < config.FORWARD_DISTANCE_MM
-                                                 else target_distance_mm)
+                        distance_for_steering = (
+                            None
+                            if target_distance_mm < config.FORWARD_DISTANCE_MM
+                            else target_distance_mm)
                         left, right = compute_steering(
                             best_box, config.FRAME_W, config.FRAME_H,
                             speed_pct=speed_pct,
@@ -1976,30 +1917,36 @@ def main():
                 last_drive_status = "not_following"
                 motors.stop()
 
-            # 11. Draw tracks
+            # 12. Draw tracks
             for t in tracks:
                 x, y, w, h = t.box
-                is_selected = (best_track is not None and t.id == best_track.id)
+                is_selected = (best_track is not None
+                               and t.id == best_track.id)
                 if t.name != "Unknown":
                     src = getattr(t, "identity_source", "memory")
+                    is_locked = getattr(t, "identity_locked", False)
                     if t.identity_fresh:
                         color = (0, 255, 0); tag = ""
-                    elif src == "body":
-                        color = (0, 255, 255); tag = " (body)"
+                    elif is_locked and t.lock_source == "body":
+                        color = (255, 200, 0); tag = " LOCK(body)"
+                    elif is_locked:
+                        color = (0, 200, 255); tag = " LOCK"
                     else:
                         color = (0, 165, 255); tag = " (mem)"
                     thickness = 3 if is_selected else 2
                     suffix = " *FOLLOW*" if is_selected else ""
                     n_sig = len(t.body_signatures)
-                    label = f"#{t.id} {t.name}: {t.confidence:.2f}{tag} [s{n_sig}]{suffix}"
+                    label = (f"#{t.id} {t.name}: {t.confidence:.2f}"
+                             f"{tag} [s{n_sig}]{suffix}")
                 else:
                     color = (0, 0, 255); thickness = 2
                     label = f"#{t.id} Unknown"
-                cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
+                cv2.rectangle(frame, (x, y), (x + w, y + h),
+                              color, thickness)
                 cv2.putText(frame, label, (x, y - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-            # 12. Face boxes
+            # 13. Face boxes
             for fr in face_recs:
                 fx, fy, fw, fh = fr["box"]
                 if not fr.get("scanned", False):
@@ -2013,16 +1960,16 @@ def main():
                     cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh),
                                   (255, 0, 255), 1)
 
-            # 13. Tesla-style overlay
+            # 14. Occupancy overlay
             if planner_on and cached_grid is not None:
-                frame = draw_occupancy_overlay(frame, cached_grid,
-                                               cached_origin, cached_path,
-                                               OCCUPANCY_GRID_RES_MM)
-                frame = draw_path_on_frame(frame, cached_path, cached_origin,
-                                           OCCUPANCY_GRID_RES_MM,
-                                           cam_fx, cam_fy)
+                frame = draw_occupancy_overlay(
+                    frame, cached_grid, cached_origin, cached_path,
+                    OCCUPANCY_GRID_RES_MM)
+                frame = draw_path_on_frame(
+                    frame, cached_path, cached_origin,
+                    OCCUPANCY_GRID_RES_MM, cam_fx, cam_fy)
 
-            # 14. Info overlays
+            # 15. Info overlays
             motor_state = "IDLE"
             motor_color = (128, 128, 128)
             if following:
@@ -2035,24 +1982,30 @@ def main():
                         motor_state = "STOP"; motor_color = (0, 165, 255)
                     else:
                         speed = calculate_speed(target_distance_mm)
-                        motor_state = f"FWD {speed}%"; motor_color = (0, 255, 0)
+                        motor_state = f"FWD {speed}%"
+                        motor_color = (0, 255, 0)
                 else:
-                    motor_state = "STOP (no depth)"; motor_color = (0, 0, 255)
-            cv2.putText(frame, f"Motor: {motor_state}", (config.FRAME_W - 280, 30),
+                    motor_state = "STOP (no depth)"
+                    motor_color = (0, 0, 255)
+            cv2.putText(frame, f"Motor: {motor_state}",
+                        (config.FRAME_W - 280, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, motor_color, 2)
 
             banner_color = (0, 255, 0) if following else (128, 128, 128)
             cv2.putText(frame, f"Following: {selector.follow_name}",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, banner_color, 2)
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, banner_color, 2)
             planner_label = "ON" if planner_on else "OFF"
             cv2.putText(frame,
-                        f"Planner: {planner_label}  (press p)",
+                        f"Planner: {planner_label}  "
+                        f"locked={sum(1 for t in tracks if getattr(t, 'identity_locked', False))}",
                         (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (200, 200, 200), 1)
             if last_drive_status:
                 cv2.putText(frame, f"Status: {last_drive_status}",
                             (10, config.FRAME_H - 15),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                            (180, 180, 180), 1)
 
             elapsed = time.monotonic() - frame_start
             sleep = max(0, frame_interval - elapsed)
@@ -2084,12 +2037,18 @@ def main():
         pass
     finally:
         auto_saver.summary()
-        try: motors.cleanup()
-        except Exception: pass
-        try: cam.stop()
-        except Exception: pass
-        try: cv2.destroyAllWindows()
-        except Exception: pass
+        try:
+            motors.cleanup()
+        except Exception:
+            pass
+        try:
+            cam.stop()
+        except Exception:
+            pass
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
 
         if args.auto_train and auto_saver.total_saved > 0:
             script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2101,9 +2060,11 @@ def main():
                 print("AUTO-TRAIN: handing off to train_face_svm.py")
                 print("=" * 60)
                 time.sleep(2.0)
-                sys.stdout.flush(); sys.stderr.flush()
+                sys.stdout.flush()
+                sys.stderr.flush()
                 try:
-                    os.execv(sys.executable, [sys.executable, train_script])
+                    os.execv(sys.executable,
+                             [sys.executable, train_script])
                 except Exception as e:
                     print(f"Auto-train exec failed: {e}")
         elif args.auto_train:

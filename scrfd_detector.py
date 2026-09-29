@@ -1,21 +1,29 @@
 """
 scrfd_detector.py -- SCRFD face detector with 5-point landmarks.
 
-Returns detections in the same format as the existing FaceDetector
-(tuple of x, y, w, h, conf) plus an extra landmarks array.
+Returns detections as tuples:
+    (x, y, w, h, conf, landmarks)
+where landmarks is a (5, 2) numpy array of (x, y) points for
+left-eye, right-eye, nose, left-mouth-corner, right-mouth-corner,
+in FULL-FRAME coordinates.
 
-Usage in tracker:
-    detector = SCRFDDetector(config.SCRFD_MODEL_PATH)
-    results = detector.infer(frame)
-    # results[i] = (x, y, w, h, conf, landmarks)
-    # landmarks shape: (5, 2) -- eyes, nose, mouth corners
+Robust to both common SCRFD ONNX export layouts:
+    - 3-D outputs:  (batch, anchors, channels)
+    - 2-D outputs:  (anchors, channels)
+
+Usage:
+    detector = SCRFDDetector(config.SCRFD_MODEL_PATH,
+                             input_size=config.SCRFD_INPUT_SIZE,
+                             conf_thres=config.SCRFD_CONF_THRES,
+                             iou_thres=config.SCRFD_IOU_THRES)
+    detections = detector.infer(frame)
 """
 import cv2
 import numpy as np
 import onnxruntime as ort
 
 
-# SCRFD model parameters (from the reference implementation)
+# SCRFD model parameters (standard for det_500m / det_2.5g / det_10g)
 FMC = 3
 FEAT_STRIDE_FPN = [8, 16, 32]
 NUM_ANCHORS = 2
@@ -51,7 +59,7 @@ def _nms(dets, iou_thres):
     keep = []
     while order.size > 0:
         i = order[0]
-        keep.append(i)
+        keep.append(int(i))
         xx1 = np.maximum(x1[i], x1[order[1:]])
         yy1 = np.maximum(y1[i], y1[order[1:]])
         xx2 = np.minimum(x2[i], x2[order[1:]])
@@ -75,14 +83,66 @@ class SCRFDDetector:
         self.iou_thres = iou_thres
         self.center_cache = {}
 
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.intra_op_num_threads = 4
         self.session = ort.InferenceSession(
-            model_path,
+            model_path, sess_options=so,
             providers=["CPUExecutionProvider"],
         )
         self.output_names = [o.name for o in self.session.get_outputs()]
         self.input_names = [i.name for i in self.session.get_inputs()]
+
         print(f"SCRFDDetector: loaded {model_path}")
-        print(f"  outputs: {len(self.output_names)} tensors")
+        print(f"  input_size={input_size}, outputs={len(self.output_names)}")
+        self._index_outputs()
+
+    def _index_outputs(self):
+        """
+        Map (kind, stride) -> output index by running one dummy inference
+        to materialize concrete shapes, then classifying by last dim
+        (1 = score, 4 = bbox, 10 = kps) and sorting by anchor count.
+
+        Handles both 3-D (batch, anchors, channels) and 2-D (anchors,
+        channels) output layouts.
+        """
+        H, W = self.input_size[1], self.input_size[0]
+        dummy = np.zeros((1, 3, H, W), dtype=np.float32)
+        try:
+            raw = self.session.run(self.output_names,
+                                   {self.input_names[0]: dummy})
+        except Exception as e:
+            raise RuntimeError(f"SCRFD probe inference failed: {e}")
+
+        by_dim = {1: [], 4: [], 10: []}
+        for i, arr in enumerate(raw):
+            a = np.asarray(arr)
+            if a.ndim == 3:          # (batch, anchors, channels)
+                anchor_count = int(a.shape[1])
+                last_dim = int(a.shape[2])
+            elif a.ndim == 2:        # (anchors, channels)
+                anchor_count = int(a.shape[0])
+                last_dim = int(a.shape[1])
+            else:
+                continue
+            if last_dim in by_dim:
+                by_dim[last_dim].append((i, anchor_count))
+
+        if any(len(by_dim[d]) != 3 for d in by_dim):
+            shapes = [list(np.asarray(a).shape) for a in raw]
+            raise RuntimeError(
+                f"SCRFD: expected 3 score / 3 bbox / 3 kps outputs. "
+                f"Got {len(by_dim[1])}/{len(by_dim[4])}/{len(by_dim[10])}. "
+                f"Shapes: {shapes}"
+            )
+
+        self._out_idx = {}
+        for kind, d in (("score", 1), ("bbox", 4), ("kps", 10)):
+            entries = sorted(by_dim[d], key=lambda t: -t[1])
+            for stride, (i, n) in zip(FEAT_STRIDE_FPN, entries):
+                self._out_idx[(kind, stride)] = i
+                print(f"    {kind:5s} stride={stride:2d}  idx={i}  "
+                      f"anchors={n}")
 
     def _forward(self, image, threshold):
         scores_list, bboxes_list, kpss_list = [], [], []
@@ -95,10 +155,11 @@ class SCRFDDetector:
         input_height = blob.shape[2]
         input_width = blob.shape[3]
 
-        for idx, stride in enumerate(FEAT_STRIDE_FPN):
-            scores = outputs[idx]
-            bbox_preds = outputs[idx + FMC] * stride
-            kps_preds = outputs[idx + FMC * 2] * stride if USE_KPS else None
+        for stride in FEAT_STRIDE_FPN:
+            scores = outputs[self._out_idx[("score", stride)]]
+            bbox_preds = outputs[self._out_idx[("bbox", stride)]] * stride
+            kps_preds = (outputs[self._out_idx[("kps", stride)]] * stride
+                         if USE_KPS else None)
 
             height = input_height // stride
             width = input_width // stride
@@ -117,18 +178,19 @@ class SCRFDDetector:
                 if len(self.center_cache) < 100:
                     self.center_cache[key] = anchor_centers
 
+            scores = scores.reshape(-1)
+            bbox_preds = bbox_preds.reshape(-1, 4)
             pos_inds = np.where(scores >= threshold)[0]
+
             bboxes = _distance2bbox(anchor_centers, bbox_preds)
-            pos_scores = scores[pos_inds]
-            pos_bboxes = bboxes[pos_inds]
-            scores_list.append(pos_scores)
-            bboxes_list.append(pos_bboxes)
+            scores_list.append(scores[pos_inds])
+            bboxes_list.append(bboxes[pos_inds])
 
             if USE_KPS:
+                kps_preds = kps_preds.reshape(-1, 10)
                 kpss = _distance2kps(anchor_centers, kps_preds)
                 kpss = kpss.reshape((kpss.shape[0], -1, 2))
-                pos_kpss = kpss[pos_inds]
-                kpss_list.append(pos_kpss)
+                kpss_list.append(kpss[pos_inds])
 
         return scores_list, bboxes_list, kpss_list
 
@@ -138,8 +200,9 @@ class SCRFDDetector:
 
         Returns a list of tuples:
             (x, y, w, h, conf, landmarks)
-        where landmarks is a (5, 2) numpy array of (x, y) points for
-        left-eye, right-eye, nose, left-mouth, right-mouth.
+        where landmarks is a (5, 2) array of (x, y) points in
+        FULL-FRAME coordinates:
+            [left-eye, right-eye, nose, left-mouth, right-mouth]
         """
         width, height = self.input_size
         im_ratio = float(frame.shape[0]) / frame.shape[1]
@@ -161,14 +224,21 @@ class SCRFDDetector:
             det_image, self.conf_thres
         )
 
-        scores = np.vstack(scores_list)
+        # --- FIX: scores are 1-D per stride; concatenate, don't vstack ---
+        if not scores_list:
+            return []
+        scores = np.concatenate(scores_list) if scores_list else np.array([])
+        if scores.size == 0:
+            return []
+
         scores_ravel = scores.ravel()
         order = scores_ravel.argsort()[::-1]
 
         bboxes = np.vstack(bboxes_list) / det_scale
         kpss = np.vstack(kpss_list) / det_scale
 
-        pre_det = np.hstack((bboxes, scores)).astype(np.float32, copy=False)
+        pre_det = np.hstack((bboxes, scores.reshape(-1, 1))).astype(
+            np.float32, copy=False)
         pre_det = pre_det[order, :]
         keep = _nms(pre_det, self.iou_thres)
         det = pre_det[keep, :]
@@ -176,7 +246,6 @@ class SCRFDDetector:
         kpss = kpss[order, :, :]
         kpss = kpss[keep, :, :]
 
-        # Convert to (x, y, w, h, conf, landmarks)
         results = []
         for i in range(det.shape[0]):
             x1, y1, x2, y2, score = det[i]

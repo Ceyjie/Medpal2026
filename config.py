@@ -8,6 +8,21 @@ RIGHT_LPWM = 19
 RIGHT_REN  = 20
 RIGHT_LEN  = 21
 
+# Identity lock release: if a locked track hasn't been matched by the
+# tracker for this many seconds, clear the lock and reset the name to
+# "Unknown". A fresh scan then runs when the person reappears.
+# Brief occlusions (walking behind a table) do not trigger this.
+IDENTITY_LOCK_RELEASE_S = 3.0
+SKIP_SCANS_WHEN_LOCKED = True
+# Assumed tracker frame rate. Used to convert seconds to frames.
+# Matches the frame_interval of 0.12 s in the main loop.
+ASSUMED_FPS = 8.0
+
+FACE_SCAN_COOLDOWN_S = 2.0
+# Identity locking: a scan with this confidence or higher locks the
+# track, and locked tracks are never re-scanned until the track dies.
+IDENTITY_LOCK_MIN_CONF = 0.80
+
 
 # Add to config.py
 CAMERA_HEIGHT_MM = 200      # measure: how high the camera sits above the floor
@@ -18,6 +33,8 @@ OCCUPANCY_GRID_SIZE = 60    # cells per side
 OCCUPANCY_GRID_RES_MM = 50  # mm per cell (5 cm)
 PLANNER_DISABLED = False      # set True to default planner off
 
+ROBOT_RADIUS_MM = 200
+# half the widest dimension of the chassis
 
 # Speed config (percentages)
 FOLLOW_BASE_SPEED = 60
@@ -25,7 +42,7 @@ REVERSE_SPEED = 30
 SPEED_INCREASE = 10
 MAX_SPEED = 100
 
-FACE_SCAN_COOLDOWN_S = 0.5     
+
 
 # Depth sensor floor
 MIN_VALID_DEPTH_MM = 55
@@ -96,7 +113,7 @@ MIN_BODY_BOX_AREA = 10000      # pixels
 
 
 # only run face embedding/recognition when the face is closer than this
-FACE_RECOGNIZE_MAX_MM = 80
+FACE_RECOGNIZE_MAX_MM = 1200
 
 
 # Coral face detection
@@ -130,7 +147,7 @@ REID_PATH = "/home/medpal/tracking_person/models/reid.onnx"
 # SCRFD + ArcFace
 SCRFD_MODEL_PATH = "/home/medpal/2026medpal/models/scrfd_arcface/det_2.5g.onnx"
 ARCFACE_MODEL_PATH = "/home/medpal/2026medpal/models/scrfd_arcface/w600k_mbf.onnx"
-SCRFD_INPUT_SIZE = (320, 320)
+SCRFD_INPUT_SIZE = (640, 640)
 SCRFD_CONF_THRES = 0.5
 SCRFD_IOU_THRES = 0.4
 ARCFACE_EMBEDDING_SIZE = 512

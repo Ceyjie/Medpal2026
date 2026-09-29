@@ -1,46 +1,45 @@
 #!/usr/bin/env python3
 """
-tracker_geminiV3.1.py -- SSD MobileNet Face + body ReID + body tracking.
+tracker_geminiV3_1.py -- Coral detection + CPU ArcFace + identity lock
+                        + Flask web control panel + RFID + touch.
 
-Face detection: SSD MobileNet V2 Face on Coral Edge TPU.
-Identity rule:
-  - Body track is the unit of identity.
-  - t.name only changes when det["scanned"] is True (face < FACE_RECOGNIZE_MAX_MM).
-  - A scanned face sets t.name to the recognized name, or "Unknown".
-  - If no face is scanned this frame, t.name is left untouched.
-  - Body signatures accumulate on ANY frame the track has a name and a body
-    embedding is available.
-  - Per-track face scan cooldown: after a track is scanned, the same track
-    will not be scanned again for FACE_SCAN_COOLDOWN_S seconds.
-
-Steering:
-  compute_steering() returns (left, right) wheel speeds.
-  apply_steering() maps the tuple onto SerialMotors discrete commands.
-  Adapted from Ceyjie/tracking_person.
+Architecture:
+  - Coral EdgeTPU: SSD MobileNet V2 Face + SSD MobileNet V2 COCO (person)
+    -> runs every frame at ~10 ms each
+  - CPU: SCRFD 640x640 + ArcFace w600k_mbf
+    -> runs ONLY on scan events (face close enough + past cooldown)
+    -> ~210 ms per scan, amortized by FACE_SCAN_COOLDOWN_S
+  - SimpleTracker keeps sticky identity; locked tracks are not re-scanned.
+  - Flask web server runs in a daemon thread, shares state via shared.py.
 
 Commands:
-    --enroll NAME            Capture face crops for a person
-    --samples N              Crops per enrollment (default 30)
-    --register-only NAME     Remove all others, then enroll only this person
     --follow NAME            Follow only this person
     --list-people            Show enrolled people and classifier state
-    --remove-person NAME     Delete a person's crops
-    --clear-auto NAME        Delete only auto-saved crops for a person
     --test-motors            Drive each wheel briefly
     --no-auto-save           Disable auto-saving for this run
-    --auto-train             Retrain classifier on exit if any crops were saved
+    --auto-train             Retrain classifier on exit if crops were saved
     --no-body-reid           Disable OSNet body ReID (saves CPU)
-    --debug-tracks           Print track signature/revival events
+    --debug-tracks           Print track signature/revival/lock events
+    --no-planner             Use reactive steering instead of A* path planning
 
 Runtime controls:
     f = start following
     s = stop
     1..9 = switch target to the Nth enrolled person
+    p = toggle planner on/off
     q = quit
+
+Web control panel:
+    http://<pi-ip>:5000
 """
 
 import os
 import sys
+
+os.environ.setdefault("ORT_LOGGING_LEVEL", "3")
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+os.environ["OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"] = "0"
+
 import cv2
 import numpy as np
 import pickle
@@ -48,11 +47,12 @@ import argparse
 import time
 import threading
 import shutil
-
-os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
-os.environ["OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"] = "0"
+import math
+import heapq
+import subprocess
 
 sys.path.append('/home/medpal/pyorbbecsdk_v1/build')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat
@@ -93,6 +93,14 @@ except ImportError:
 
 import config
 from serial_motors import SerialMotors
+from scrfd_detector import SCRFDDetector
+from arcface_embedder import ArcFaceEmbedder
+from path_planner import PathPlanner
+
+from shared import command_queue, state, frame_lock, frame_holder
+from web_server import (start_web_server, set_motors_instance,
+                        on_rfid_enrolled, on_rfid_timeout,
+                        _load_rfid_persons, _load_auth_uids)
 
 
 # ============================================================
@@ -114,26 +122,47 @@ class Camera:
         self.color_frame = None
         self.depth_frame = None
         self.color_running = True
-        self.color_thread = threading.Thread(target=self._color_capture, daemon=True)
+        self.depth_running = False
+        self.use_orbbec_depth = False
+
+        self.color_thread = threading.Thread(
+            target=self._color_capture, daemon=True)
         self.color_thread.start()
         print("Using cv2.VideoCapture for color")
+
         if USE_ORBBEC_DEPTH:
-            self.depth_pipeline = Pipeline()
-            self.depth_config = Config()
-            profiles = self.depth_pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
             try:
-                self.depth_profile = profiles.get_video_stream_profile(320, 240, OBFormat.Y16, 15)
-            except:
-                self.depth_profile = profiles.get_default_video_stream_profile()
-            self.depth_config.enable_stream(self.depth_profile)
-            self.depth_pipeline.start(self.depth_config)
-            self.depth_running = True
-            self.depth_thread = threading.Thread(target=self._depth_capture, daemon=True)
-            self.depth_thread.start()
-            self.use_orbbec_depth = True
-            print(f"Using Astra for depth ({self.depth_profile.get_width()}x{self.depth_profile.get_height()})")
-        else:
-            self.use_orbbec_depth = False
+                self.depth_pipeline = Pipeline()
+                self.depth_config = Config()
+                profiles = self.depth_pipeline.get_stream_profile_list(
+                    OBSensorType.DEPTH_SENSOR)
+                self.depth_profile = None
+                for w, h, fps in [(320, 240, 15), (320, 240, 30),
+                                  (640, 480, 15)]:
+                    try:
+                        self.depth_profile = \
+                            profiles.get_video_stream_profile(
+                                w, h, OBFormat.Y16, fps)
+                        print(f"Depth profile: {w}x{h}@{fps}")
+                        break
+                    except Exception:
+                        continue
+                if self.depth_profile is None:
+                    self.depth_profile = \
+                        profiles.get_default_video_stream_profile()
+                    print(f"Depth profile: default "
+                          f"({self.depth_profile.get_width()}x"
+                          f"{self.depth_profile.get_height()})")
+                self.depth_config.enable_stream(self.depth_profile)
+                self.depth_pipeline.start(self.depth_config)
+                self.depth_running = True
+                self.depth_thread = threading.Thread(
+                    target=self._depth_capture, daemon=True)
+                self.depth_thread.start()
+                self.use_orbbec_depth = True
+            except Exception as e:
+                print(f"Depth pipeline unavailable: {e}")
+                self.use_orbbec_depth = False
 
     def _color_capture(self):
         while self.color_running:
@@ -150,8 +179,13 @@ class Camera:
                     df = frames.get_depth_frame()
                     if df:
                         w, h = df.get_width(), df.get_height()
-                        scale = df.get_depth_scale()
-                        data = np.frombuffer(df.get_data(), dtype=np.uint16).reshape(h, w)
+                        try:
+                            scale = df.get_depth_scale()
+                        except AttributeError:
+                            scale = 1.0
+                        data = np.frombuffer(
+                            df.get_data(),
+                            dtype=np.uint16).reshape(h, w)
                         depth_mm = data.astype(np.float32) * scale
                         depth_mm[depth_mm < config.MIN_VALID_DEPTH_MM] = 0
                         self.depth_frame = depth_mm
@@ -168,28 +202,38 @@ class Camera:
 
     def stop(self):
         self.color_running = False
-        self.color_thread.join()
+        try:
+            self.color_thread.join(timeout=1.0)
+        except Exception:
+            pass
         self.color_cap.release()
         if self.use_orbbec_depth:
             self.depth_running = False
-            self.depth_thread.join()
-            self.depth_pipeline.stop()
+            try:
+                self.depth_thread.join(timeout=1.0)
+            except Exception:
+                pass
+            try:
+                self.depth_pipeline.stop()
+            except Exception:
+                pass
 
 
 # ============================================================
-# Face Detector -- SSD MobileNet V2 Face on Coral
+# Face Detector (Coral SSD MobileNet V2 Face)
 # ============================================================
 class FaceDetector:
     def __init__(self, model_path, label_path=None):
+        if not PYCORAL_AVAILABLE and not CORAL_AVAILABLE:
+            raise RuntimeError(
+                "FaceDetector needs pycoral or tflite_runtime.")
         self.labels = []
         if label_path and os.path.exists(label_path):
             with open(label_path) as f:
                 self.labels = [l.strip() for l in f.readlines()]
-
         self.mode = None
         self.engine = None
         self.interpreter = None
-        self.last_top_score = 0.0
 
         if PYCORAL_AVAILABLE:
             try:
@@ -203,7 +247,8 @@ class FaceDetector:
 
         if CORAL_EDGETPU:
             delegate = load_delegate('libedgetpu.so.1')
-            self.interpreter = Interpreter(model_path, experimental_delegates=[delegate])
+            self.interpreter = Interpreter(
+                model_path, experimental_delegates=[delegate])
         else:
             cpu_path = model_path.replace('_edgetpu', '')
             self.interpreter = Interpreter(cpu_path)
@@ -227,15 +272,12 @@ class FaceDetector:
         self.engine.invoke()
         h, w = frame.shape[:2]
         sx, sy = w / inp_w, h / inp_h
-        objs = pycoral_detect.get_objects(self.engine,
-                                          score_threshold=config.CONF_THRES)
+        objs = pycoral_detect.get_objects(
+            self.engine, score_threshold=config.CONF_THRES)
         results = []
-        self.last_top_score = 0.0
         for obj in objs:
-            self.last_top_score = max(self.last_top_score, float(obj.score))
             bbox = obj.bbox
-            x = int(bbox.xmin * sx)
-            y = int(bbox.ymin * sy)
+            x = int(bbox.xmin * sx); y = int(bbox.ymin * sy)
             bw = int((bbox.xmax - bbox.xmin) * sx)
             bh = int((bbox.ymax - bbox.ymin) * sy)
             results.append((x, y, bw, bh, float(obj.score)))
@@ -246,17 +288,18 @@ class FaceDetector:
         target_h, target_w = self.input_shape[1], self.input_shape[2]
         resized = cv2.resize(frame, (target_w, target_h))
         input_data = np.expand_dims(resized, axis=0).astype(np.uint8)
-        self.interpreter.set_tensor(self.input_details[0]['index'], input_data)
+        self.interpreter.set_tensor(
+            self.input_details[0]['index'], input_data)
         self.interpreter.invoke()
-        boxes = self.interpreter.tensor(self.output_details[0]['index'])()
-        classes = self.interpreter.tensor(self.output_details[1]['index'])()
-        scores = self.interpreter.tensor(self.output_details[2]['index'])()
+        boxes = self.interpreter.tensor(
+            self.output_details[0]['index'])()
+        classes = self.interpreter.tensor(
+            self.output_details[1]['index'])()
+        scores = self.interpreter.tensor(
+            self.output_details[2]['index'])()
         results = []
-        self.last_top_score = 0.0
         for i in range(int(scores[0].shape[0])):
             score = float(scores[0][i])
-            if score > self.last_top_score:
-                self.last_top_score = score
             if score < config.CONF_THRES:
                 continue
             y1, x1, y2, x2 = boxes[0][i]
@@ -265,15 +308,15 @@ class FaceDetector:
             results.append((x, y, bw, bh, score))
         return results
 
-    def top_detection_label(self):
-        return f"top face score {self.last_top_score:.3f}"
-
 
 # ============================================================
-# Body Detector (Coral SSD COCO, person class)
+# Body Detector (Coral SSD MobileNet V2 COCO, person class)
 # ============================================================
 class BodyDetector:
     def __init__(self, model_path, label_path=None):
+        if not PYCORAL_AVAILABLE and not CORAL_AVAILABLE:
+            raise RuntimeError(
+                "BodyDetector needs pycoral or tflite_runtime.")
         self.labels = []
         if label_path and os.path.exists(label_path):
             with open(label_path) as f:
@@ -303,7 +346,8 @@ class BodyDetector:
 
         if CORAL_EDGETPU:
             delegate = load_delegate('libedgetpu.so.1')
-            self.interpreter = Interpreter(model_path, experimental_delegates=[delegate])
+            self.interpreter = Interpreter(
+                model_path, experimental_delegates=[delegate])
         else:
             cpu_path = model_path.replace('_edgetpu', '')
             self.interpreter = Interpreter(cpu_path)
@@ -327,7 +371,8 @@ class BodyDetector:
         self.engine.invoke()
         h, w = frame.shape[:2]
         sx, sy = w / inp_w, h / inp_h
-        objs = pycoral_detect.get_objects(self.engine, score_threshold=self.conf_thres)
+        objs = pycoral_detect.get_objects(
+            self.engine, score_threshold=self.conf_thres)
         results = []
         for obj in objs:
             if obj.id != self.PERSON_CLASS:
@@ -344,11 +389,15 @@ class BodyDetector:
         target_h, target_w = self.input_shape[1], self.input_shape[2]
         resized = cv2.resize(frame, (target_w, target_h))
         input_data = np.expand_dims(resized, axis=0).astype(np.uint8)
-        self.interpreter.set_tensor(self.input_details[0]['index'], input_data)
+        self.interpreter.set_tensor(
+            self.input_details[0]['index'], input_data)
         self.interpreter.invoke()
-        boxes = self.interpreter.tensor(self.output_details[0]['index'])()
-        classes = self.interpreter.tensor(self.output_details[1]['index'])()
-        scores = self.interpreter.tensor(self.output_details[2]['index'])()
+        boxes = self.interpreter.tensor(
+            self.output_details[0]['index'])()
+        classes = self.interpreter.tensor(
+            self.output_details[1]['index'])()
+        scores = self.interpreter.tensor(
+            self.output_details[2]['index'])()
         results = []
         for i in range(int(scores[0].shape[0])):
             score = float(scores[0][i])
@@ -370,13 +419,12 @@ class BodyDetector:
 class BodyReID:
     def __init__(self, model_path):
         if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Body ReID model not found: {model_path}")
+            raise FileNotFoundError(
+                f"Body ReID model not found: {model_path}")
         if not ONNX_AVAILABLE:
             raise RuntimeError("onnxruntime not installed.")
-
         self.session = ort.InferenceSession(
-            model_path, providers=["CPUExecutionProvider"],
-        )
+            model_path, providers=["CPUExecutionProvider"])
         self.input_name = self.session.get_inputs()[0].name
         shape = self.session.get_inputs()[0].shape
         self.input_h = 256
@@ -402,76 +450,9 @@ class BodyReID:
         try:
             out = self.session.run(None, {self.input_name: img})[0]
         except Exception as e:
-            print(f"BodyReID error: {e}")
+            print(f"BodyReID inference error: {e}")
             return None
         vec = out.flatten().astype(np.float32)
-        norm = np.linalg.norm(vec)
-        return vec / norm if norm > 0 else vec
-
-
-# ============================================================
-# Face Embedder (Coral FaceNet)
-# ============================================================
-class FaceEmbedder:
-    def __init__(self, model_path):
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Face embedding model not found: {model_path}")
-        self.interpreter = None
-        self.input_details = None
-        self.output_details = None
-        self.input_h = 224
-        self.input_w = 224
-        self.embedding_dim = 1024
-        self.input_dtype = np.uint8
-
-        if CORAL_EDGETPU:
-            delegate = load_delegate('libedgetpu.so.1')
-            self.interpreter = Interpreter(model_path, experimental_delegates=[delegate])
-        else:
-            cpu_path = model_path.replace('_edgetpu', '')
-            self.interpreter = Interpreter(cpu_path)
-        self.interpreter.allocate_tensors()
-        self.input_details = self.interpreter.get_input_details()
-        self.output_details = self.interpreter.get_output_details()
-        shape = self.input_details[0]['shape']
-        if len(shape) == 4:
-            h_candidate, w_candidate = int(shape[1]), int(shape[2])
-            if h_candidate >= 32 and w_candidate >= 32:
-                self.input_h, self.input_w = h_candidate, w_candidate
-            elif int(shape[2]) >= 32 and int(shape[3]) >= 32:
-                self.input_h, self.input_w = int(shape[2]), int(shape[3])
-        out_shape = self.output_details[0]['shape']
-        if len(out_shape) > 0:
-            self.embedding_dim = int(out_shape[-1])
-        self.input_dtype = self.input_details[0]['dtype']
-        print(f"FaceEmbedder: input {self.input_w}x{self.input_h} "
-              f"dtype={self.input_dtype.__name__}, output {self.embedding_dim}-D")
-
-    def embed(self, face_crop):
-        h, w = face_crop.shape[:2]
-        if h == 0 or w == 0:
-            return None
-        if w < 96 or h < 96:
-            pad_x = max(0, (96 - w) // 2)
-            pad_y = max(0, (96 - h) // 2)
-            face_crop = cv2.copyMakeBorder(
-                face_crop, pad_y, pad_y, pad_x, pad_x,
-                cv2.BORDER_REFLECT_101,
-            )
-        h2, w2 = face_crop.shape[:2]
-        interp = cv2.INTER_CUBIC if (self.input_w >= w2 and self.input_h >= h2) else cv2.INTER_AREA
-        img = cv2.resize(face_crop, (self.input_w, self.input_h), interpolation=interp)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        if self.input_dtype == np.uint8:
-            img = img.astype(np.uint8)
-        else:
-            img = img.astype(np.float32)
-            img = (img - 127.5) / 128.0
-        img = np.expand_dims(img, axis=0)
-        self.interpreter.set_tensor(self.input_details[0]['index'], img)
-        self.interpreter.invoke()
-        output = self.interpreter.tensor(self.output_details[0]['index'])()
-        vec = output.flatten().astype(np.float32)
         norm = np.linalg.norm(vec)
         if norm > 0:
             vec = vec / norm
@@ -505,17 +486,20 @@ class FaceRecognizer:
             print(f"FaceRecognizer: failed to load ({e})")
             return
         if data.get("model_type") != "centroid_gallery":
-            print(f"FaceRecognizer: unexpected type {data.get('model_type')}")
+            print(f"FaceRecognizer: unexpected type "
+                  f"{data.get('model_type')}")
             return
         self.names = list(data["names"])
-        self.centroids = data["centroids"]
-        self.galleries = [np.asarray(g, dtype=np.float32) for g in data["galleries"]]
-        self.stats_p10 = data["stats_p10"]
-        self.stats_p50 = data["stats_p50"]
-        self.stats_p90 = data["stats_p90"]
+        self.centroids = np.asarray(data["centroids"], dtype=np.float32)
+        self.galleries = [np.asarray(g, dtype=np.float32)
+                          for g in data["galleries"]]
+        self.stats_p10 = np.asarray(data["stats_p10"], dtype=np.float32)
+        self.stats_p50 = np.asarray(data["stats_p50"], dtype=np.float32)
+        self.stats_p90 = np.asarray(data["stats_p90"], dtype=np.float32)
         self.available = True
         sizes = [g.shape[0] for g in self.galleries]
-        print(f"FaceRecognizer: loaded for {self.names} (gallery sizes: {sizes})")
+        print(f"FaceRecognizer: loaded for {self.names} "
+              f"(galleries: {sizes})")
 
     def predict(self, embedding, top_k=3):
         if not self.available or embedding is None:
@@ -524,7 +508,8 @@ class FaceRecognizer:
         q = q / (np.linalg.norm(q) + 1e-9)
         best_combined = -1.0
         best_idx = -1
-        for i, (centroid, gallery) in enumerate(zip(self.centroids, self.galleries)):
+        for i, (centroid, gallery) in enumerate(
+                zip(self.centroids, self.galleries)):
             score_cent = float(centroid @ q)
             gallery_sims = gallery @ q
             k = min(top_k, len(gallery_sims))
@@ -557,7 +542,8 @@ class FaceRecognizer:
         return None, confidence
 
     def update_gallery(self, name, embedding, confidence):
-        if not self.available or name not in self.names or embedding is None:
+        if not self.available or name not in self.names or \
+                embedding is None:
             return False
         if confidence < self.UPDATE_MIN_CONF:
             return False
@@ -594,13 +580,16 @@ class TrackConfirmationCache:
     HOLD_FRAMES = 60
     IOU_THRESH = 0.4
     CACHE_MIN_CONF = 0.85
+
     def __init__(self):
         self.entries = []
+
     def update(self, frame_count, box, name, confidence):
         if name != "Unknown" and confidence >= self.CACHE_MIN_CONF:
             self.entries.append((frame_count, box, name))
         self.entries = [e for e in self.entries
                         if frame_count - e[0] <= self.HOLD_FRAMES]
+
     def confirmed_name_for(self, frame_count, box):
         best_name = None
         best_iou = 0.0
@@ -626,6 +615,7 @@ class AutoSaver:
     VARIETY_SIM_THRESH = 0.90
     RECENT_WINDOW = 20
     MAX_PER_SESSION = 50
+
     def __init__(self, enabled=True):
         self.enabled = enabled
         self.recent = {}
@@ -636,15 +626,18 @@ class AutoSaver:
         self.total_saved = 0
         self.total_direct = 0
         self.total_track = 0
+
     def maybe_save(self, name, face_crop, embedding, confidence,
                    confirmed_by_track=False):
         if not self.enabled or name is None or embedding is None:
             return False
-        min_conf = (self.MIN_CONF_TRACK if confirmed_by_track else self.MIN_CONF_DIRECT)
+        min_conf = (self.MIN_CONF_TRACK if confirmed_by_track
+                    else self.MIN_CONF_DIRECT)
         if confidence < min_conf:
             return False
         h, w = face_crop.shape[:2]
-        if w < config.ENROLL_MIN_FACE_PX or h < config.ENROLL_MIN_FACE_PX:
+        if w < config.ENROLL_MIN_FACE_PX or \
+                h < config.ENROLL_MIN_FACE_PX:
             return False
         gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
         blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
@@ -680,28 +673,35 @@ class AutoSaver:
             self.total_saved += 1
             if confirmed_by_track:
                 self.total_track += 1
-                self.saved_track[name] = self.saved_track.get(name, 0) + 1
+                self.saved_track[name] = \
+                    self.saved_track.get(name, 0) + 1
             else:
                 self.total_direct += 1
-                self.saved_direct[name] = self.saved_direct.get(name, 0) + 1
-            print(f"AUTO-SAVED: {fname}  (conf {confidence:.2f}, "
+                self.saved_direct[name] = \
+                    self.saved_direct.get(name, 0) + 1
+            print(f"AUTO-SAVED: {fname}  "
+                  f"(conf {confidence:.2f}, "
                   f"{'track' if confirmed_by_track else 'direct'}, "
-                  f"blur {blur_var:.0f}, session {count + 1}/{self.MAX_PER_SESSION})")
+                  f"blur {blur_var:.0f}, "
+                  f"session {count + 1}/{self.MAX_PER_SESSION})")
             return True
         return False
+
     def summary(self):
         if self.total_saved == 0:
             return
         print(f"\nAuto-saver saved {self.total_saved} crops this session "
-              f"({self.total_direct} direct, {self.total_track} track):")
+              f"({self.total_direct} direct, "
+              f"{self.total_track} track):")
         for n in self.saved_count:
             d = self.saved_direct.get(n, 0)
             t = self.saved_track.get(n, 0)
-            print(f"  {n}: {self.saved_count[n]} ({d} direct, {t} track)")
+            print(f"  {n}: {self.saved_count[n]} "
+                  f"({d} direct, {t} track)")
 
 
 # ============================================================
-# Track + Tracker
+# Track with identity lock
 # ============================================================
 class Track:
     MAX_SIG = 10
@@ -723,6 +723,11 @@ class Track:
         self.identity_source = "face" if has_face else "none"
         self.last_scan_frame = -999
 
+        # Identity lock
+        self.identity_locked = False
+        self.lock_frame = -1
+        self.lock_source = "none"
+
     def add_signature(self, embedding):
         if embedding is None:
             return False
@@ -738,18 +743,21 @@ class Track:
         return True
 
 
+# ============================================================
+# SimpleTracker with identity lock
+# ============================================================
 class SimpleTracker:
     MIN_MATCH_SCORE = 0.30
     SMOOTH_ALPHA = 0.55
     VEL_ALPHA = 0.5
-    REID_MAX_FRAMES = 60
+    REID_MAX_FRAMES = 240
     REID_MAX_DIST = 150
     BODY_REVIVE_THRESH = 0.90
     SIG_ACCUM_MIN_CONF = 0.85
     SIG_ACCUM_INTERVAL = 5
     UNKNOWN_MAX_LOST = 20
 
-    def __init__(self, max_lost=180, debug=False):
+    def __init__(self, max_lost=600, debug=False):
         self.max_lost = max_lost
         self.debug = debug
         self.tracks = []
@@ -821,16 +829,30 @@ class SimpleTracker:
                     t.confidence = det.get("conf", 0.0)
                     t.identity_fresh = True
                     t.identity_source = "face"
+                    lock_min = getattr(config,
+                                       "IDENTITY_LOCK_MIN_CONF", 0.85)
+                    if t.confidence >= lock_min and \
+                            not t.identity_locked:
+                        t.identity_locked = True
+                        t.lock_frame = frame_count
+                        t.lock_source = "face"
+                        if self.debug:
+                            print(f"[track #{t.id}] LOCKED as "
+                                  f"'{t.name}' (conf "
+                                  f"{t.confidence:.2f})")
                 else:
-                    t.name = "Unknown"
-                    t.confidence = 0.0
-                    t.identity_fresh = False
-                    t.identity_source = "none"
-                    t.body_signatures = []
+                    if not t.identity_locked:
+                        t.name = "Unknown"
+                        t.confidence = 0.0
+                        t.identity_fresh = False
+                        t.identity_source = "none"
+                        t.body_signatures = []
                 t.identity_set_frame = frame_count
             else:
                 t.identity_fresh = False
-                if t.name != "Unknown":
+                if t.identity_locked:
+                    t.identity_source = "face"
+                elif t.name != "Unknown":
                     t.identity_source = "memory"
                 else:
                     t.identity_source = "none"
@@ -843,9 +865,9 @@ class SimpleTracker:
                     if t.add_signature(det["body_embedding"]):
                         self._last_sig_frame[t.id] = frame_count
                         if self.debug:
-                            print(f"[track #{t.id}] stored body signature "
-                                  f"({len(t.body_signatures)} total, "
-                                  f"name={t.name}, conf={t.confidence:.2f})")
+                            print(f"[track #{t.id}] stored body "
+                                  f"signature "
+                                  f"({len(t.body_signatures)} total)")
 
             t.lost = 0
             t.age += 1
@@ -854,11 +876,14 @@ class SimpleTracker:
             if di in matched_dets:
                 continue
 
-            if not det.get("scanned", False) and not det.get("face_only_proxy", False):
+            if (not det.get("scanned", False)
+                    and not det.get("face_only_proxy", False)):
                 bx, by, bw, bh = det["box"]
                 if (bw < getattr(config, "MIN_BODY_BOX_W", 60)
                         or bh < getattr(config, "MIN_BODY_BOX_H", 120)
-                        or bw * bh < getattr(config, "MIN_BODY_BOX_AREA", 10000)):
+                        or bw * bh < getattr(config,
+                                             "MIN_BODY_BOX_AREA",
+                                             10000)):
                     continue
 
             revived_name = None
@@ -909,13 +934,26 @@ class SimpleTracker:
             if det.get("scanned", False):
                 t.identity_source = "face" if new_name else "none"
                 t.last_scan_frame = frame_count
+                lock_min = getattr(config,
+                                   "IDENTITY_LOCK_MIN_CONF", 0.85)
+                if new_name is not None and new_conf >= lock_min:
+                    t.identity_locked = True
+                    t.lock_frame = frame_count
+                    t.lock_source = "face"
+                    if self.debug:
+                        print(f"[new track #{t.id}] LOCKED as "
+                              f"'{new_name}' (conf {new_conf:.2f})")
             elif new_name is not None:
                 t.identity_fresh = False
                 t.body_signatures = list(revived_sigs)
                 t.identity_source = "body"
+                t.identity_locked = True
+                t.lock_frame = frame_count
+                t.lock_source = "body"
                 if self.debug:
-                    print(f"[new track #{t.id}] revived as '{new_name}' "
-                          f"via body ReID ({len(revived_sigs)} sigs)")
+                    print(f"[new track #{t.id}] REVIVED and LOCKED as "
+                          f"'{new_name}' via body ReID "
+                          f"({len(revived_sigs)} sigs)")
 
             if (t.name != "Unknown"
                     and det.get("body_embedding") is not None):
@@ -927,7 +965,8 @@ class SimpleTracker:
 
         alive = []
         for t in self.tracks:
-            limit = self.max_lost if t.name != "Unknown" else self.UNKNOWN_MAX_LOST
+            limit = (self.max_lost if t.name != "Unknown"
+                     else self.UNKNOWN_MAX_LOST)
             if t.lost <= limit:
                 alive.append(t)
             else:
@@ -937,8 +976,9 @@ class SimpleTracker:
                          list(t.body_signatures))
                     )
                     if self.debug:
-                        print(f"[track #{t.id}] died with "
-                              f"{len(t.body_signatures)} body sigs -> cached")
+                        print(f"[track #{t.id}] died "
+                              f"({len(t.body_signatures)} sigs cached, "
+                              f"was_locked={t.identity_locked})")
                 self._last_sig_frame.pop(t.id, None)
         self.tracks = alive
 
@@ -960,22 +1000,30 @@ class TargetSelector:
         self.locked_since = 0
         self.SWITCH_MARGIN = 0.08
         self.HOLD_FRAMES = 30
+
     def set_name(self, name):
         if name and name != self.follow_name:
             print(f"Target switched to: {name}")
             self.follow_name = name
             self.locked_name = None
             self.locked_since = 0
+
     def choose(self, frame_count, tracks):
-        candidates = [t for t in tracks if t.name != "Unknown" and t.lost == 0]
+        candidates = [t for t in tracks
+                      if t.name != "Unknown" and t.lost == 0]
         if not candidates:
             return None
         if self.follow_name is not None:
             wanted = [t for t in candidates
-                      if t.name.casefold() == self.follow_name.casefold()]
+                      if t.name.casefold() ==
+                      self.follow_name.casefold()]
             if not wanted:
                 return None
             candidates = wanted
+        locked = [t for t in candidates
+                  if getattr(t, "identity_locked", False)]
+        if locked:
+            candidates = locked
         best = max(candidates, key=lambda t: t.confidence)
         if self.locked_name is None:
             self.locked_name = best.name
@@ -990,7 +1038,8 @@ class TargetSelector:
         held_duration = frame_count - self.locked_since
         if (held_duration >= self.HOLD_FRAMES
                 and best.name != self.locked_name
-                and best.confidence - held_best.confidence > self.SWITCH_MARGIN):
+                and best.confidence - held_best.confidence >
+                self.SWITCH_MARGIN):
             self.locked_name = best.name
             self.locked_since = frame_count
             return best
@@ -1015,11 +1064,12 @@ def get_sector_distances(depth, person_box, depth_w, depth_h):
     third = depth_w // 3
     sectors = {}
     for name, (c1, c2) in [("left", (0, third)),
-                            ("center", (third, 2 * third)),
-                            ("right", (2 * third, depth_w))]:
+                           ("center", (third, 2 * third)),
+                           ("right", (2 * third, depth_w))]:
         region = band[:, c1:c2]
         valid = region[region > 0]
-        sectors[name] = float(np.min(valid)) if valid.size > 0 else np.inf
+        sectors[name] = (float(np.min(valid))
+                         if valid.size > 0 else np.inf)
     return sectors
 
 
@@ -1031,77 +1081,10 @@ def calculate_speed(distance_mm):
     elif distance_mm < config.FORWARD_DISTANCE_MM:
         return 0
     else:
-        extra = ((distance_mm - config.FORWARD_DISTANCE_MM) // 100) * config.SPEED_INCREASE
-        return min(config.FOLLOW_BASE_SPEED + extra, config.MAX_SPEED)
-
-
-# ============================================================
-# Steering (adapted from Ceyjie/tracking_person)
-# ============================================================
-def compute_steering(bbox, frame_w, frame_h, speed_pct, distance_mm=None,
-                     deadband=80):
-    """
-    Compute (left, right) wheel speeds from a target box and depth.
-
-    Returns a tuple of two integers in [-100, 100]:
-      positive = forward, negative = backward, 0 = stopped.
-
-    Rules:
-      - If the target is within MIN_DISTANCE_MM, return (0, 0).
-      - If the target center is within `deadband` pixels of frame center,
-        drive both wheels forward at speed_pct.
-      - Otherwise pivot toward the target: near wheel backward, far wheel
-        forward at turn_speed (half base speed, floor 20).
-    """
-    if distance_mm is not None and distance_mm < config.MIN_DISTANCE_MM:
-        return 0, 0
-    if bbox is None:
-        return 0, 0
-
-    x, y, w, h = bbox
-    cx = x + w // 2
-    frame_cx = frame_w // 2
-
-    if abs(cx - frame_cx) <= deadband:
-        return int(speed_pct), int(speed_pct)
-
-    turn_speed = max(20, int(speed_pct) // 2)
-    if cx < frame_cx:
-        # Target on the left -> pivot left (left wheel back, right forward)
-        return -turn_speed, turn_speed
-    else:
-        # Target on the right -> pivot right (left forward, right back)
-        return turn_speed, -turn_speed
-
-
-def apply_steering(motors, left, right):
-    """
-    Map a (left, right) wheel-speed tuple onto SerialMotors commands.
-
-    SerialMotors exposes discrete commands (F, B, L, R, S) plus set_speed,
-    not true differential drive. We pick the dominant motion:
-      - both forward       -> forward at max(|left|, |right|)
-      - both backward      -> backward at max(|left|, |right|)
-      - left < 0, right > 0 -> pivot left
-      - left > 0, right < 0 -> pivot right
-      - both zero           -> stop
-    """
-    if left == 0 and right == 0:
-        motors.stop()
-        return
-
-    if left > 0 and right > 0:
-        motors.set_speed(max(left, right))
-        motors.forward()
-    elif left < 0 and right < 0:
-        motors.set_speed(max(-left, -right))
-        motors.backward()
-    elif left < 0 and right > 0:
-        motors.set_speed(max(-left, right))
-        motors.turn_left()
-    else:  # left > 0 and right < 0
-        motors.set_speed(max(left, -right))
-        motors.turn_right()
+        extra = ((distance_mm - config.FORWARD_DISTANCE_MM) // 100) * \
+                config.SPEED_INCREASE
+        return min(config.FOLLOW_BASE_SPEED + extra,
+                   config.MAX_SPEED)
 
 
 # ============================================================
@@ -1121,12 +1104,10 @@ def run_enrollment(cam, face_detector, person_name, target_count):
     print(f"  Output directory: {person_dir}")
     print(f"  Existing crops:   {start_index}")
     print(f"  Will capture:     {target_count}")
-    print(f"  Press 'q' to stop early.\n")
     captured = 0
     attempts = 0
     max_attempts = target_count * 40
     last_saved_gray = None
-    no_face_frames = 0
     cv2.namedWindow("Enrollment", cv2.WINDOW_NORMAL)
     try:
         while captured < target_count and attempts < max_attempts:
@@ -1136,12 +1117,8 @@ def run_enrollment(cam, face_detector, person_name, target_count):
                 time.sleep(0.02)
                 continue
             faces = face_detector.infer(frame)
-            best = None
-            if faces:
-                best = max(faces, key=lambda f: f[2] * f[3])
-            status_color = (0, 0, 255)
-            status_text = "No face detected"
-            saved_this_frame = False
+            best = max(faces, key=lambda f: f[2] * f[3]) \
+                if faces else None
             if best is not None:
                 x, y, w, h, conf = best
                 x = max(0, x); y = max(0, y)
@@ -1150,56 +1127,27 @@ def run_enrollment(cam, face_detector, person_name, target_count):
                 face_crop = frame[y:y2, x:x2]
                 if face_crop.size == 0:
                     continue
-                ok_size = w >= config.ENROLL_MIN_FACE_PX and h >= config.ENROLL_MIN_FACE_PX
                 gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
                 blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-                ok_blur = blur_var >= config.ENROLL_BLUR_THRES
-                ok_diverse = True
-                if last_saved_gray is not None:
-                    try:
-                        resized = cv2.resize(gray, (64, 64))
-                        diff = float(np.mean(np.abs(
-                            resized.astype(np.float32) - last_saved_gray.astype(np.float32)
-                        )))
-                        ok_diverse = diff >= config.ENROLL_DIVERSITY_PX
-                    except Exception:
-                        ok_diverse = True
-                if ok_size and ok_blur and ok_diverse:
-                    fname = os.path.join(person_dir, f"enroll_{start_index + captured:04d}.jpg")
+                ok = (w >= config.ENROLL_MIN_FACE_PX
+                      and h >= config.ENROLL_MIN_FACE_PX
+                      and blur_var >= config.ENROLL_BLUR_THRES)
+                if ok:
+                    fname = os.path.join(
+                        person_dir,
+                        f"enroll_{start_index + captured:04d}.jpg")
                     cv2.imwrite(fname, face_crop)
                     last_saved_gray = cv2.resize(gray, (64, 64))
                     captured += 1
-                    saved_this_frame = True
-                    status_color = (0, 255, 0)
-                    status_text = f"Captured {captured}/{target_count} (blur {blur_var:.0f})"
-                    print(f"  Captured {captured}/{target_count}  [size {w}x{h}, blur {blur_var:.0f}]")
-                else:
-                    reasons = []
-                    if not ok_size: reasons.append(f"too small ({w}x{h})")
-                    if not ok_blur: reasons.append(f"blurry ({blur_var:.0f})")
-                    if not ok_diverse: reasons.append("too similar to last")
-                    status_color = (0, 200, 255)
-                    status_text = "Skipped: " + ", ".join(reasons)
-                box_color = (0, 255, 0) if saved_this_frame else (0, 200, 255)
-                cv2.rectangle(frame, (x, y), (x + w, y + h), box_color, 2)
-            else:
-                no_face_frames += 1
-            cv2.putText(frame, f"Enroll: {person_name}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(frame, status_text, (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
-            cv2.putText(frame, f"Progress: {captured}/{target_count}",
-                        (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            if no_face_frames > 30:
-                cv2.putText(frame, "Move closer / improve lighting",
-                            (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+                    print(f"  Captured {captured}/{target_count}  "
+                          f"[size {w}x{h}, blur {blur_var:.0f}]")
             cv2.imshow("Enrollment", frame)
             if cv2.waitKey(10) & 0xFF == ord('q'):
                 break
     finally:
         cv2.destroyAllWindows()
-    print(f"\nEnrollment finished: {captured} new crops saved to {person_dir}")
-    print(f"Total crops for '{person_name}': {start_index + captured}")
+    print(f"\nEnrollment finished: {captured} crops saved to "
+          f"{person_dir}")
 
 
 # ============================================================
@@ -1213,15 +1161,11 @@ def run_list_people():
         try:
             with open(svm_path, "rb") as f:
                 data = pickle.load(f)
-            model_type = data.get("model_type", "unknown")
             trained_names = list(data.get("names", []))
             print(f"Trained classifier: {svm_path}")
-            print(f"  Model type: {model_type}")
-            print(f"  Classes:    {trained_names}")
+            print(f"  Classes: {trained_names}")
         except Exception as e:
-            print(f"Trained classifier exists but could not be read: {e}")
-    else:
-        print(f"No trained classifier yet (expected at {svm_path})")
+            print(f"Could not read classifier: {e}")
     print()
     if not os.path.isdir(train_dir):
         print(f"No training directory at {train_dir}")
@@ -1235,16 +1179,9 @@ def run_list_people():
     for idx, p in enumerate(people, start=1):
         all_crops = [f for f in os.listdir(os.path.join(train_dir, p))
                      if f.lower().endswith((".jpg", ".png", ".jpeg"))]
-        enroll_crops = [f for f in all_crops if f.startswith("enroll_")]
-        auto_direct = [f for f in all_crops if f.startswith("auto_dir_")]
-        auto_track = [f for f in all_crops if f.startswith("auto_trk_")]
-        other = len(all_crops) - len(enroll_crops) - len(auto_direct) - len(auto_track)
         marker = "  [trained]" if p in trained_names else ""
-        print(f"  [{idx}] {p:20s} {len(all_crops):4d} crops "
-              f"({len(enroll_crops)} enroll, {len(auto_direct)} auto_dir, "
-              f"{len(auto_track)} auto_trk"
-              + (f", {other} other" if other > 0 else "") + f"){marker}")
-    print("\nUse --follow NAME to select one, or press 1..9 at runtime.")
+        print(f"  [{idx}] {p:20s} {len(all_crops):4d} crops{marker}")
+    print("\nUse --follow NAME to select one.")
 
 
 def run_remove_person(name, delete_auto=False):
@@ -1255,24 +1192,43 @@ def run_remove_person(name, delete_auto=False):
         return
     crops = [f for f in os.listdir(person_dir)
              if f.lower().endswith((".jpg", ".png", ".jpeg"))]
-    auto_crops = [f for f in crops if f.startswith("auto_")]
-    enroll_crops = [f for f in crops if not f.startswith("auto_")]
-    if delete_auto and enroll_crops:
+    if delete_auto:
+        auto_crops = [f for f in crops
+                      if f.startswith(("auto_", "live_"))]
         for f in auto_crops:
             os.remove(os.path.join(person_dir, f))
-        print(f"Removed {len(auto_crops)} auto-saved crops for '{name}'.")
-        print(f"Kept {len(enroll_crops)} enrollment crops.")
+        print(f"Removed {len(auto_crops)} auto-saved crops for "
+              f"'{name}'.")
         return
-    print(f"Removing '{name}': {len(crops)} crops from {person_dir}")
+    print(f"Removing '{name}': {len(crops)} crops")
     shutil.rmtree(person_dir)
     remaining = [d for d in os.listdir(config.FACE_TRAINING_DIR)
-                 if os.path.isdir(os.path.join(config.FACE_TRAINING_DIR, d))]
-    if not remaining:
-        if os.path.exists(config.SVM_MODEL_PATH):
-            os.remove(config.SVM_MODEL_PATH)
-            print("No people left; removed the stale classifier as well.")
+                 if os.path.isdir(
+                     os.path.join(config.FACE_TRAINING_DIR, d))]
+    if not remaining and os.path.exists(config.SVM_MODEL_PATH):
+        os.remove(config.SVM_MODEL_PATH)
+        print("Removed stale classifier (no people left).")
+
+
+# ============================================================
+# RFID handling
+# ============================================================
+def handle_rfid_uid(uid):
+    """Called from the SerialMotors reader thread when a card is scanned
+    outside enrollment mode. Switches follow target if UID is authorized
+    and mapped to a person."""
+    uid = uid.strip().upper()
+    authorized = _load_auth_uids()
+    if uid not in authorized:
+        print(f"[rfid] UID {uid} not authorized")
+        return
+    mapping = _load_rfid_persons()
+    person = mapping.get(uid)
+    if person:
+        print(f"[rfid] switching follow target to {person}")
+        command_queue.put(("follow", person))
     else:
-        print(f"Remaining people: {remaining}")
+        print(f"[rfid] UID {uid} authorized but has no person mapping")
 
 
 # ============================================================
@@ -1281,7 +1237,8 @@ def run_remove_person(name, delete_auto=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--enroll", metavar="NAME")
-    parser.add_argument("--samples", type=int, default=config.ENROLL_DEFAULT_COUNT)
+    parser.add_argument("--samples", type=int,
+                        default=config.ENROLL_DEFAULT_COUNT)
     parser.add_argument("--register-only", metavar="NAME")
     parser.add_argument("--follow", metavar="NAME")
     parser.add_argument("--list-people", action="store_true")
@@ -1292,6 +1249,11 @@ def main():
     parser.add_argument("--auto-train", action="store_true")
     parser.add_argument("--no-body-reid", action="store_true")
     parser.add_argument("--debug-tracks", action="store_true")
+    parser.add_argument("--no-planner", action="store_true",
+                        help="Use reactive steering, not A* path planning")
+    parser.add_argument("--web-port", type=int, default=5000)
+    parser.add_argument("--no-web", action="store_true",
+                        help="Do not start the web server")
     args = parser.parse_args()
 
     if args.list_people:
@@ -1311,17 +1273,17 @@ def main():
                 full = os.path.join(train_dir, d)
                 if os.path.isdir(full):
                     shutil.rmtree(full)
-                    print(f"Removed existing enrollment: {d}")
         if os.path.exists(config.SVM_MODEL_PATH):
             os.remove(config.SVM_MODEL_PATH)
-            print("Removed old classifier.")
         args.enroll = args.register_only
+
+    planner_on = not args.no_planner
 
     cam = Camera()
     face_detector = FaceDetector(config.CORAL_FACE_DETECTION_MODEL,
-                                  config.CORAL_FACE_LABELS)
+                                 config.CORAL_FACE_LABELS)
     body_detector = BodyDetector(config.CORAL_DETECTION_MODEL,
-                                  config.CORAL_LABELS)
+                                 config.CORAL_LABELS)
 
     if args.enroll:
         run_enrollment(cam, face_detector, args.enroll, args.samples)
@@ -1329,13 +1291,25 @@ def main():
         return
     if args.test_motors:
         motors = SerialMotors()
-        motors.test_motors()
-        try: motors.cleanup()
-        except Exception: pass
+        try:
+            motors.test_motors()
+        except AttributeError:
+            print("SerialMotors has no test_motors method")
+        try:
+            motors.cleanup()
+        except Exception:
+            pass
         cam.stop()
         return
 
-    face_embedder = FaceEmbedder(config.MOBILEFACENET_MODEL)
+    # --- CPU recognition ---
+    arcface = ArcFaceEmbedder(config.ARCFACE_MODEL_PATH)
+    scrfd = SCRFDDetector(
+        config.SCRFD_MODEL_PATH,
+        input_size=config.SCRFD_INPUT_SIZE,
+        conf_thres=config.SCRFD_CONF_THRES,
+        iou_thres=config.SCRFD_IOU_THRES,
+    )
     face_recognizer = FaceRecognizer(config.SVM_MODEL_PATH)
 
     body_reid = None
@@ -1345,25 +1319,56 @@ def main():
         except Exception as e:
             print(f"Body ReID disabled: {e}")
             body_reid = None
-    if body_reid is None:
-        print("Body ReID: DISABLED")
-    else:
-        print("Body ReID: ENABLED")
+    print(f"Body ReID: {'ENABLED' if body_reid else 'DISABLED'}")
 
+    # --- Motors with RFID callbacks ---
+    motors = SerialMotors(
+        on_rfid_enrolled=on_rfid_enrolled,
+        on_rfid_timeout=on_rfid_timeout,
+        on_rfid=handle_rfid_uid,
+    )
+    set_motors_instance(motors)
+    state["motors_available"] = motors.available
+
+    # --- Planner (optional) ---
+    planner = PathPlanner(
+        cam_height_mm=getattr(config, "CAMERA_HEIGHT_MM", 200),
+        cam_tilt_deg=getattr(config, "CAMERA_TILT_DEG", 15),
+        cam_hfov_deg=getattr(config, "CAMERA_HFOV_DEG", 60),
+        grid_size=getattr(config, "OCCUPANCY_GRID_SIZE", 60),
+        res_mm=getattr(config, "OCCUPANCY_GRID_RES_MM", 50),
+        robot_radius_mm=getattr(config, "ROBOT_RADIUS_MM", 200),
+    )
+    try:
+        planner.load_calibration(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "camera_calib.yml"))
+    except Exception as e:
+        print(f"[planner] calibration load failed: {e}")
+
+    # --- Web server ---
+    if not args.no_web:
+        start_web_server(host="0.0.0.0", port=args.web_port)
+
+    # --- Follow target selection ---
     follow_name = args.follow.strip() if args.follow else None
     if not face_recognizer.available or not face_recognizer.names:
         print("\nNo classifier / no enrolled people. Cannot follow.")
-        cam.stop()
-        return
-    if follow_name is None:
+        if not args.no_web:
+            print("Web panel still available for enrollment/training.")
+        # We still proceed to the main loop; the tracker just won't
+        # have anyone to follow.
+    if follow_name is None and face_recognizer.names:
         if len(face_recognizer.names) == 1:
             follow_name = face_recognizer.names[0]
-            print(f"Only one enrolled person -> following '{follow_name}'.")
+            print(f"Only one enrolled person -> following "
+                  f"'{follow_name}'.")
         else:
             print(f"\nEnrolled people: {face_recognizer.names}")
             if sys.stdin.isatty():
                 while True:
-                    pick = input("Enter name to follow (or 'q' to quit): ").strip()
+                    pick = input("Enter name to follow "
+                                 "(or 'q' to quit): ").strip()
                     if pick.casefold() == 'q':
                         cam.stop()
                         return
@@ -1371,53 +1376,54 @@ def main():
                                if n.casefold() == pick.casefold()]
                     if matches:
                         follow_name = matches[0]
-                        print(f"Following '{follow_name}'.")
                         break
                     print(f"'{pick}' is not enrolled. Try again.")
             else:
                 follow_name = face_recognizer.names[0]
-                print(f"Non-interactive: defaulting to '{follow_name}'.")
-    else:
+    elif follow_name is not None:
         matches = [n for n in face_recognizer.names
                    if n.casefold() == follow_name.casefold()]
         if not matches:
             print(f"'{follow_name}' is not enrolled.")
-            cam.stop()
-            return
-        follow_name = matches[0]
-        print(f"Following '{follow_name}' (from --follow).")
+            follow_name = None
+        else:
+            follow_name = matches[0]
 
     selector = TargetSelector(follow_name=follow_name)
-    auto_save_enabled = (getattr(config, "AUTO_SAVE_RECOGNIZED_CROPS", True)
-                         and not args.no_auto_save)
+    state["follow_name"] = follow_name
+    auto_save_enabled = (
+        getattr(config, "AUTO_SAVE_RECOGNIZED_CROPS", True)
+        and not args.no_auto_save)
     auto_saver = AutoSaver(enabled=auto_save_enabled)
-    motors = SerialMotors()
 
-    tracker = SimpleTracker(max_lost=180, debug=args.debug_tracks)
+    tracker = SimpleTracker(max_lost=600, debug=args.debug_tracks)
     following = False
     last_drive_status = None
     frame_interval = 0.12
     frame_count = 0
     track_cache = TrackConfirmationCache()
 
-    face_max_mm = getattr(config, "FACE_RECOGNIZE_MAX_MM", 80)
-    scan_cooldown_s = getattr(config, "FACE_SCAN_COOLDOWN_S", 5.0)
+    cached_path = []
+    cached_grid = None
+    cached_origin = None
+    plan_every = 3
+
+    face_max_mm = getattr(config, "FACE_RECOGNIZE_MAX_MM", 1200)
+    scan_cooldown_s = getattr(config, "FACE_SCAN_COOLDOWN_S", 2.0)
     scan_cooldown_frames = int(scan_cooldown_s * 8)
+    lock_min_conf = getattr(config, "IDENTITY_LOCK_MIN_CONF", 0.85)
     min_body_w = getattr(config, "MIN_BODY_BOX_W", 60)
     min_body_h = getattr(config, "MIN_BODY_BOX_H", 120)
     min_body_area = getattr(config, "MIN_BODY_BOX_AREA", 10000)
 
-    print(f"\nRunning. Currently following: {selector.follow_name}")
-    print("Controls: q=quit, f=follow, s=stop, 1..9=switch target")
-    print(f"Auto-save: {'ON' if auto_save_enabled else 'OFF'}")
-    print(f"Face scan gate: only faces closer than {face_max_mm} mm")
-    print(f"Face scan cooldown: {scan_cooldown_s:.1f} s per track")
-    print(f"Body min box: {min_body_w}x{min_body_h}, area >= {min_body_area}")
-    if args.auto_train:
-        print("Auto-train: ON")
-    if args.debug_tracks:
-        print("Track debug: ON")
-    cv2.namedWindow("MedPal Face Tracker", cv2.WINDOW_NORMAL)
+    print(f"\nRunning. Following: {selector.follow_name}")
+    print("Controls: q=quit, f=follow, s=stop, 1..9=switch, p=planner")
+    print(f"Planner: {'ON' if planner_on else 'OFF'}")
+    print(f"Face scan gate: {face_max_mm} mm, "
+          f"cooldown {scan_cooldown_s:.1f} s")
+    print(f"Identity lock at conf >= {lock_min_conf:.2f}")
+    if not args.no_web:
+        print(f"Web panel: http://0.0.0.0:{args.web_port}")
 
     try:
         while True:
@@ -1427,8 +1433,73 @@ def main():
             if frame is None:
                 time.sleep(0.01)
                 continue
+
+            # Publish frame for MJPEG streaming
+            with frame_lock:
+                frame_holder["frame"] = frame.copy()
+
+            # Process commands from web / touch / RFID
+            while not command_queue.empty():
+                try:
+                    cmd_type, payload = command_queue.get_nowait()
+                except Exception:
+                    break
+
+                if cmd_type == "motor":
+                    if payload == "forward":
+                        motors.forward()
+                    elif payload == "backward":
+                        motors.backward()
+                    elif payload == "left":
+                        motors.turn_left()
+                    elif payload == "right":
+                        motors.turn_right()
+                    elif payload == "stop":
+                        motors.stop()
+
+                elif cmd_type == "servo":
+                    if payload == "open":
+                        motors.servo_open()
+                        state["servo_open"] = True
+                    elif payload == "close":
+                        motors.servo_close()
+                        state["servo_open"] = False
+                    elif payload == "toggle":
+                        if state["servo_open"]:
+                            motors.servo_close()
+                            state["servo_open"] = False
+                        else:
+                            motors.servo_open()
+                            state["servo_open"] = True
+
+                elif cmd_type == "follow":
+                    selector.set_name(payload)
+                    state["follow_name"] = payload
+                    state["following"] = True
+                    following = True
+
+                elif cmd_type == "enroll":
+                    state["mode"] = f"enroll:{payload['name']}"
+                    run_enrollment(cam, face_detector,
+                                   payload["name"],
+                                   payload["samples"])
+                    state["mode"] = "idle"
+
+                elif cmd_type == "train":
+                    state["mode"] = "training"
+                    try:
+                        subprocess.Popen(
+                            ["python3", "train_face_svm.py"],
+                            cwd=os.path.dirname(
+                                os.path.abspath(__file__)))
+                        print("[train] spawned train_face_svm.py")
+                    except Exception as e:
+                        print(f"[train] failed to spawn: {e}")
+                    state["mode"] = "idle"
+
             depth = cam.read_depth()
 
+            # 1. Coral detection
             faces = face_detector.infer(frame)
             bodies_raw = body_detector.infer(frame)
 
@@ -1438,6 +1509,7 @@ def main():
                         and bw * bh >= min_body_area):
                     bodies.append((bx, by, bw, bh, bconf))
 
+            # 2. Scan faces (skipping locked tracks)
             face_recs = []
             for (fx, fy, fw, fh, fconf) in faces:
                 fx = max(0, fx); fy = max(0, fy)
@@ -1464,17 +1536,12 @@ def main():
 
                 too_far = (face_depth_mm is not None
                            and face_depth_mm > face_max_mm)
-
                 if too_far:
                     face_recs.append({
                         "box": (fx, fy, fx2 - fx, fy2 - fy),
-                        "name": None,
-                        "conf": 0.0,
-                        "embedding": None,
-                        "crop": face_crop,
-                        "depth_mm": face_depth_mm,
-                        "skipped": True,
-                        "scanned": False,
+                        "name": None, "conf": 0.0, "embedding": None,
+                        "crop": face_crop, "depth_mm": face_depth_mm,
+                        "skipped": True, "scanned": False,
                         "in_cooldown": False,
                     })
                     continue
@@ -1484,8 +1551,13 @@ def main():
                 in_cooldown = False
                 for tr in tracker.tracks:
                     tx, ty, tw, th = tr.box
-                    if tx <= face_cx <= tx + tw and ty <= face_cy <= ty + th:
-                        frames_since = frame_count - getattr(tr, "last_scan_frame", -999)
+                    if (tx <= face_cx <= tx + tw
+                            and ty <= face_cy <= ty + th):
+                        if getattr(tr, "identity_locked", False):
+                            in_cooldown = True
+                            break
+                        frames_since = frame_count - getattr(
+                            tr, "last_scan_frame", -999)
                         if frames_since < scan_cooldown_frames:
                             in_cooldown = True
                             break
@@ -1493,31 +1565,45 @@ def main():
                 if in_cooldown:
                     face_recs.append({
                         "box": (fx, fy, fx2 - fx, fy2 - fy),
-                        "name": None,
-                        "conf": 0.0,
-                        "embedding": None,
-                        "crop": face_crop,
-                        "depth_mm": face_depth_mm,
-                        "skipped": True,
-                        "scanned": False,
+                        "name": None, "conf": 0.0, "embedding": None,
+                        "crop": face_crop, "depth_mm": face_depth_mm,
+                        "skipped": True, "scanned": False,
                         "in_cooldown": True,
                     })
                     continue
 
-                embedding = face_embedder.embed(face_crop)
-                name, svm_conf = face_recognizer.predict(embedding)
+                # Passed gates -> scan with SCRFD + ArcFace
+                embedding = None
+                name = None
+                svm_conf = 0.0
+
+                dets = scrfd.infer(frame)
+                if dets:
+                    _, _, _, _, _, lm_frame = max(
+                        dets, key=lambda d: d[2] * d[3])
+                    lm_crop = lm_frame.copy().astype(np.float32)
+                    lm_crop[:, 0] -= fx
+                    lm_crop[:, 1] -= fy
+                    try:
+                        embedding = arcface.embed(
+                            face_crop, landmarks=lm_crop)
+                    except ValueError as e:
+                        print(f"  scan skipped: {e}")
+                        embedding = None
+                    if embedding is not None:
+                        name, svm_conf = face_recognizer.predict(
+                            embedding)
+
                 face_recs.append({
                     "box": (fx, fy, fx2 - fx, fy2 - fy),
-                    "name": name,
-                    "conf": svm_conf,
+                    "name": name, "conf": svm_conf,
                     "embedding": embedding,
-                    "crop": face_crop,
-                    "depth_mm": face_depth_mm,
-                    "skipped": False,
-                    "scanned": True,
+                    "crop": face_crop, "depth_mm": face_depth_mm,
+                    "skipped": False, "scanned": True,
                     "in_cooldown": False,
                 })
 
+            # 3. Body ReID
             body_embs = []
             if body_reid is not None:
                 for (bx, by, bw, bh, bconf) in bodies:
@@ -1525,11 +1611,13 @@ def main():
                     bx2 = min(frame.shape[1], bx + bw)
                     by2 = min(frame.shape[0], by + bh)
                     body_crop = frame[by:by2, bx:bx2]
-                    emb = body_reid.embed(body_crop) if body_crop.size > 0 else None
+                    emb = (body_reid.embed(body_crop)
+                           if body_crop.size > 0 else None)
                     body_embs.append(emb)
             else:
                 body_embs = [None] * len(bodies)
 
+            # 4. Associate faces with bodies
             detections = []
             used_faces = set()
             for i, (bx, by, bw, bh, bconf) in enumerate(bodies):
@@ -1546,8 +1634,10 @@ def main():
                     fx, fy, fw, fh = fr["box"]
                     fcx = fx + fw // 2
                     fcy = fy + fh // 2
-                    if bx <= fcx <= bx + bw and by <= fcy <= by + bh:
-                        face_conf = fr["conf"] if fr["name"] is not None else 0.0
+                    if (bx <= fcx <= bx + bw
+                            and by <= fcy <= by + bh):
+                        face_conf = (fr["conf"]
+                                     if fr["name"] is not None else 0.0)
                         if face_conf > best_conf:
                             best_conf = face_conf
                             best_face = (fi, fr)
@@ -1557,8 +1647,7 @@ def main():
                     fr = best_face[1]
                     detections.append({
                         "box": body_box,
-                        "name": fr["name"],
-                        "conf": fr["conf"],
+                        "name": fr["name"], "conf": fr["conf"],
                         "has_face": True,
                         "scanned": fr.get("scanned", False),
                         "face_box": fr["box"],
@@ -1570,17 +1659,15 @@ def main():
                 else:
                     detections.append({
                         "box": body_box,
-                        "name": None,
-                        "conf": 0.0,
-                        "has_face": False,
-                        "scanned": False,
-                        "face_box": None,
-                        "face_crop": None,
+                        "name": None, "conf": 0.0,
+                        "has_face": False, "scanned": False,
+                        "face_box": None, "face_crop": None,
                         "embedding": None,
                         "body_embedding": body_embs[i],
                         "face_only_proxy": False,
                     })
 
+            # 4b. Face-only fallback
             for fi, fr in enumerate(face_recs):
                 if fi in used_faces:
                     continue
@@ -1593,10 +1680,8 @@ def main():
                 proxy_box = (fx, fy, fw, proxy_h)
                 detections.append({
                     "box": proxy_box,
-                    "name": fr["name"],
-                    "conf": fr["conf"],
-                    "has_face": True,
-                    "scanned": True,
+                    "name": fr["name"], "conf": fr["conf"],
+                    "has_face": True, "scanned": True,
                     "face_box": fr["box"],
                     "face_crop": fr["crop"],
                     "embedding": fr["embedding"],
@@ -1604,74 +1689,39 @@ def main():
                     "face_only_proxy": True,
                 })
 
+            # 5. Tracker update
             tracks = tracker.update(detections, frame_count)
 
+            # 6. Auto-save
             for det in detections:
                 if (det["has_face"] and det.get("scanned", False)
                         and det["name"] is not None
                         and det["embedding"] is not None):
-                    face_recognizer.update_gallery(det["name"], det["embedding"], det["conf"])
+                    face_recognizer.update_gallery(
+                        det["name"], det["embedding"], det["conf"])
                     confirmed_by_track = (
-                        track_cache.confirmed_name_for(frame_count, det["box"]) == det["name"]
+                        track_cache.confirmed_name_for(
+                            frame_count, det["box"]) == det["name"]
                     )
                     auto_saver.maybe_save(
-                        det["name"], det["face_crop"], det["embedding"], det["conf"],
+                        det["name"], det["face_crop"],
+                        det["embedding"], det["conf"],
                         confirmed_by_track=confirmed_by_track,
                     )
-                    track_cache.update(frame_count, det["box"], det["name"], det["conf"])
+                    track_cache.update(frame_count, det["box"],
+                                       det["name"], det["conf"])
 
+            # 7. Target selection
             best_track = selector.choose(frame_count, tracks)
+            state["follow_name"] = selector.follow_name
+            state["following"] = following
             best_box = best_track.box if best_track else None
-            person_cx = (best_box[0] + best_box[2] // 2) if best_box else None
-            person_cy = (best_box[1] + best_box[3] // 2) if best_box else None
+            person_cx = ((best_box[0] + best_box[2] // 2)
+                         if best_box else None)
+            person_cy = ((best_box[1] + best_box[3] // 2)
+                         if best_box else None)
 
-            for t in tracks:
-                x, y, w, h = t.box
-                is_selected = (best_track is not None and t.id == best_track.id)
-
-                if t.name != "Unknown":
-                    src = getattr(t, "identity_source", "memory")
-                    if t.identity_fresh:
-                        color = (0, 255, 0)
-                        tag = ""
-                    elif src == "body":
-                        color = (0, 255, 255)
-                        tag = " (body)"
-                    else:
-                        color = (0, 165, 255)
-                        tag = " (mem)"
-                    thickness = 3 if is_selected else 2
-                    suffix = " *FOLLOW*" if is_selected else ""
-                    n_sig = len(t.body_signatures)
-                    label = (f"#{t.id} {t.name}: {t.confidence:.2f}"
-                             f"{tag} [s{n_sig}]{suffix}")
-                else:
-                    color = (0, 0, 255); thickness = 2
-                    label = f"#{t.id} Unknown"
-
-                cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
-                cv2.putText(frame, label, (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-            for fr in face_recs:
-                fx, fy, fw, fh = fr["box"]
-                if not fr.get("scanned", False):
-                    if fr.get("in_cooldown"):
-                        cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh),
-                                      (200, 120, 0), 1)
-                        cv2.putText(frame, "cooldown", (fx, fy - 4),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 120, 0), 1)
-                    else:
-                        cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh),
-                                      (128, 128, 128), 1)
-                        d = fr.get("depth_mm")
-                        txt = f"{d:.0f}mm (no scan)" if d else "no scan"
-                        cv2.putText(frame, txt, (fx, fy - 4),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
-                else:
-                    cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh),
-                                  (255, 0, 255), 1)
-
+            # 8. Depth at target
             target_distance_mm = None
             if best_box is not None and depth is not None:
                 dh, dw = depth.shape[:2]
@@ -1686,45 +1736,54 @@ def main():
                     valid = roi[roi > 0]
                     if valid.size > 0:
                         target_distance_mm = float(np.median(valid))
-                    else:
-                        target_distance_mm = float(depth[dcy, dcx])
-                x, y, w, h = best_box
-                if target_distance_mm is not None:
-                    color = (0, 255, 0) if target_distance_mm > config.MIN_DISTANCE_MM else (0, 0, 255)
-                    cv2.putText(frame, f"{target_distance_mm:.0f}mm", (x, y + h + 15),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
+            # 9. Obstacle sectors
             if depth is not None:
                 _dh, _dw = depth.shape[:2]
-                obstacle_sectors = get_sector_distances(depth, best_box, _dw, _dh)
+                obstacle_sectors = get_sector_distances(
+                    depth, best_box, _dw, _dh)
             else:
-                obstacle_sectors = {"left": np.inf, "center": np.inf, "right": np.inf}
+                obstacle_sectors = {"left": np.inf,
+                                    "center": np.inf,
+                                    "right": np.inf}
 
+            # 10. Path planning
+            if (planner_on and depth is not None
+                    and frame_count % plan_every == 0):
+                grid, origin = planner.build_grid(depth)
+                if grid is not None:
+                    grid = planner.inflate_obstacles(grid)
+                    cached_grid = grid
+                    cached_origin = origin
+                    if best_box is not None and \
+                            target_distance_mm is not None:
+                        planner.set_goal_world(target_distance_mm, 0)
+                        cached_path = planner.plan(grid, origin)
+                    else:
+                        cached_path = []
+
+            # 11. Motor control
             frame_cx = config.FRAME_W // 2
             cx = person_cx
 
-            # --- Motor control ---
             if following:
                 if best_box is None:
-                    if last_drive_status != "no_target":
-                        print(f"STATUS: {selector.follow_name} not visible.")
                     last_drive_status = "no_target"
                     motors.stop()
-                elif obstacle_sectors["center"] < config.OBSTACLE_STOP_MM:
-                    if last_drive_status != "obstacle_stop":
-                        print(f"STATUS: Obstacle ahead "
-                              f"({obstacle_sectors['center']:.0f} mm).")
+                elif planner_on and cached_path:
+                    status = planner.steer(
+                        motors, cached_path,
+                        follow_speed=config.FOLLOW_BASE_SPEED,
+                        turn_speed=config.FOLLOW_BASE_SPEED)
+                    last_drive_status = status
+                elif obstacle_sectors["center"] < \
+                        config.OBSTACLE_STOP_MM:
                     last_drive_status = "obstacle_stop"
                     motors.stop()
                 elif target_distance_mm is None:
-                    if last_drive_status != "no_depth":
-                        print("STATUS: No depth data. Stopped.")
                     last_drive_status = "no_depth"
                     motors.stop()
                 elif target_distance_mm < config.REVERSE_DISTANCE_MM:
-                    if last_drive_status != "reversing":
-                        print(f"STATUS: Target too close "
-                              f"({target_distance_mm:.0f} mm). Reversing.")
                     last_drive_status = "reversing"
                     motors.set_speed(config.REVERSE_SPEED)
                     motors.backward()
@@ -1735,66 +1794,126 @@ def main():
                             motors.turn_right()
                 elif target_distance_mm < config.FORWARD_DISTANCE_MM:
                     last_drive_status = "target_close"
-                    if cx is None:
-                        motors.stop()
-                    else:
-                        left, right = compute_steering(
-                            best_box, config.FRAME_W, config.FRAME_H,
-                            speed_pct=config.FOLLOW_BASE_SPEED,
-                            distance_mm=None,
-                            deadband=80,
-                        )
-                        if left == 0 and right == 0:
-                            motors.stop()
-                        else:
-                            apply_steering(motors, left, right)
+                    motors.stop()
+                    if cx is not None:
+                        if cx < frame_cx - 80:
+                            motors.set_speed(config.FOLLOW_BASE_SPEED)
+                            motors.turn_left()
+                        elif cx > frame_cx + 80:
+                            motors.set_speed(config.FOLLOW_BASE_SPEED)
+                            motors.turn_right()
                 else:
                     last_drive_status = "tracking"
                     speed = calculate_speed(target_distance_mm)
-                    left, right = compute_steering(
-                        best_box, config.FRAME_W, config.FRAME_H,
-                        speed_pct=speed,
-                        distance_mm=target_distance_mm,
-                        deadband=80,
-                    )
-                    apply_steering(motors, left, right)
+                    if cx is not None:
+                        if cx < frame_cx - 80:
+                            motors.set_speed(config.FOLLOW_BASE_SPEED)
+                            motors.turn_left()
+                        elif cx > frame_cx + 80:
+                            motors.set_speed(config.FOLLOW_BASE_SPEED)
+                            motors.turn_right()
+                        else:
+                            motors.set_speed(speed)
+                            motors.forward()
+                    else:
+                        motors.set_speed(speed)
+                        motors.forward()
             else:
                 last_drive_status = "not_following"
                 motors.stop()
 
+            # 12. Draw tracks
+            for t in tracks:
+                x, y, w, h = t.box
+                is_selected = (best_track is not None
+                               and t.id == best_track.id)
+                if t.name != "Unknown":
+                    src = getattr(t, "identity_source", "memory")
+                    is_locked = getattr(t, "identity_locked", False)
+                    if t.identity_fresh:
+                        color = (0, 255, 0); tag = ""
+                    elif is_locked and t.lock_source == "body":
+                        color = (255, 200, 0); tag = " LOCK(body)"
+                    elif is_locked:
+                        color = (0, 200, 255); tag = " LOCK"
+                    else:
+                        color = (0, 165, 255); tag = " (mem)"
+                    thickness = 3 if is_selected else 2
+                    suffix = " *FOLLOW*" if is_selected else ""
+                    n_sig = len(t.body_signatures)
+                    label = (f"#{t.id} {t.name}: {t.confidence:.2f}"
+                             f"{tag} [s{n_sig}]{suffix}")
+                else:
+                    color = (0, 0, 255); thickness = 2
+                    label = f"#{t.id} Unknown"
+                cv2.rectangle(frame, (x, y), (x + w, y + h),
+                              color, thickness)
+                cv2.putText(frame, label, (x, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+            # 13. Face boxes
+            for fr in face_recs:
+                fx, fy, fw, fh = fr["box"]
+                if not fr.get("scanned", False):
+                    if fr.get("in_cooldown"):
+                        cv2.rectangle(frame, (fx, fy),
+                                      (fx + fw, fy + fh),
+                                      (200, 120, 0), 1)
+                    else:
+                        cv2.rectangle(frame, (fx, fy),
+                                      (fx + fw, fy + fh),
+                                      (128, 128, 128), 1)
+                else:
+                    cv2.rectangle(frame, (fx, fy),
+                                  (fx + fw, fy + fh),
+                                  (255, 0, 255), 1)
+
+            # 14. Info overlays
             motor_state = "IDLE"
             motor_color = (128, 128, 128)
             if following:
                 if best_box is None:
-                    motor_state = "NO TARGET"; motor_color = (0, 0, 255)
+                    motor_state = "NO TARGET"
+                    motor_color = (0, 0, 255)
                 elif target_distance_mm is not None:
                     if target_distance_mm < config.REVERSE_DISTANCE_MM:
-                        motor_state = "BACKWARD"; motor_color = (0, 0, 255)
-                    elif target_distance_mm < config.FORWARD_DISTANCE_MM:
-                        motor_state = "STOP"; motor_color = (0, 165, 255)
+                        motor_state = "BACKWARD"
+                        motor_color = (0, 0, 255)
+                    elif target_distance_mm < \
+                            config.FORWARD_DISTANCE_MM:
+                        motor_state = "STOP"
+                        motor_color = (0, 165, 255)
                     else:
                         speed = calculate_speed(target_distance_mm)
-                        motor_state = f"FWD {speed}%"; motor_color = (0, 255, 0)
+                        motor_state = f"FWD {speed}%"
+                        motor_color = (0, 255, 0)
                 else:
-                    motor_state = "STOP (no depth)"; motor_color = (0, 0, 255)
-            cv2.putText(frame, f"Motor: {motor_state}", (config.FRAME_W - 280, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, motor_color, 2)
-
-            if auto_save_enabled and auto_saver.saved_count:
-                y = 55
-                for name, total in sorted(auto_saver.saved_count.items()):
-                    d = auto_saver.saved_direct.get(name, 0)
-                    t = auto_saver.saved_track.get(name, 0)
-                    cv2.putText(frame, f"{name}:{total} (d{d}/t{t})",
-                                (config.FRAME_W - 260, y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
-                    y += 20
+                    motor_state = "STOP (no depth)"
+                    motor_color = (0, 0, 255)
+            cv2.putText(frame, f"Motor: {motor_state}",
+                        (config.FRAME_W - 280, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        motor_color, 2)
 
             banner_color = (0, 255, 0) if following else (128, 128, 128)
-            cv2.putText(frame, f"Following: {selector.follow_name}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, banner_color, 2)
-            cv2.putText(frame, f"Face scan: <{face_max_mm}mm, cooldown {scan_cooldown_s:.1f}s",
-                        (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            cv2.putText(frame, f"Following: {selector.follow_name}",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, banner_color, 2)
+
+            planner_label = "ON" if planner_on else "OFF"
+            n_locked = sum(1 for t in tracks
+                           if getattr(t, "identity_locked", False))
+            cv2.putText(
+                frame,
+                f"Planner:{planner_label}  locked={n_locked}  "
+                f"scan<{face_max_mm}mm@{scan_cooldown_s:.1f}s",
+                (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                (200, 200, 200), 1)
+            if last_drive_status:
+                cv2.putText(frame, f"Status: {last_drive_status}",
+                            (10, config.FRAME_H - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                            (180, 180, 180), 1)
 
             elapsed = time.monotonic() - frame_start
             sleep = max(0, frame_interval - elapsed)
@@ -1812,6 +1931,9 @@ def main():
                 following = False
                 motors.stop()
                 print("Stopped following.")
+            elif key == ord('p'):
+                planner_on = not planner_on
+                print(f"Planner {'ON' if planner_on else 'OFF'}")
             elif ord('1') <= key <= ord('9'):
                 idx = key - ord('1')
                 if 0 <= idx < len(face_recognizer.names):
@@ -1823,30 +1945,45 @@ def main():
         pass
     finally:
         auto_saver.summary()
-        try: motors.cleanup()
-        except Exception: pass
-        try: cam.stop()
-        except Exception: pass
-        try: cv2.destroyAllWindows()
-        except Exception: pass
+        try:
+            motors.stop()
+        except Exception:
+            pass
+        try:
+            motors.cleanup()
+        except Exception:
+            pass
+        try:
+            cam.stop()
+        except Exception:
+            pass
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
 
         if args.auto_train and auto_saver.total_saved > 0:
             script_dir = os.path.dirname(os.path.abspath(__file__))
-            train_script = os.path.join(script_dir, "train_face_svm.py")
+            train_script = os.path.join(script_dir,
+                                        "train_face_svm.py")
             if not os.path.exists(train_script):
-                print(f"\nAuto-train skipped: {train_script} not found.")
+                print(f"\nAuto-train skipped: {train_script} "
+                      f"not found.")
             else:
                 print("\n" + "=" * 60)
                 print("AUTO-TRAIN: handing off to train_face_svm.py")
                 print("=" * 60)
                 time.sleep(2.0)
-                sys.stdout.flush(); sys.stderr.flush()
+                sys.stdout.flush()
+                sys.stderr.flush()
                 try:
-                    os.execv(sys.executable, [sys.executable, train_script])
+                    os.execv(sys.executable,
+                             [sys.executable, train_script])
                 except Exception as e:
                     print(f"Auto-train exec failed: {e}")
         elif args.auto_train:
-            print("\nAuto-train: no crops saved this session; skipping.")
+            print("\nAuto-train: no crops saved this session; "
+                  "skipping.")
 
 
 if __name__ == "__main__":

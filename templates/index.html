@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>MedPal Control</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: sans-serif; background: #1a1a2e; color: #eee;
+               margin: 0; padding: 16px; }
+        h1 { color: #4fc3f7; font-size: 1.4em; margin: 0 0 12px; }
+        h2 { color: #4fc3f7; font-size: 1em; margin: 0 0 10px; }
+        .container { max-width: 720px; margin: 0 auto; }
+        .video-wrap img { width: 100%; border-radius: 8px;
+                          background: #000; display: block; }
+        .panel { background: #16213e; border-radius: 8px;
+                 padding: 14px; margin: 14px 0; }
+        .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+        button { padding: 10px 16px; border: none; border-radius: 6px;
+                 cursor: pointer; font-size: 0.95em; font-weight: 500; }
+        .btn-primary { background: #0f3460; color: #fff; }
+        .btn-primary:hover { background: #1a5276; }
+        .btn-danger  { background: #e94560; color: #fff; }
+        .btn-danger:hover { background: #c73650; }
+        .btn-success { background: #16a085; color: #fff; }
+        .btn-success:hover { background: #1abc9c; }
+        .status-box { background: #0f3460; padding: 10px;
+                      border-radius: 6px; font-size: 0.9em;
+                      margin-top: 8px; line-height: 1.5; }
+        .status-box span { color: #4fc3f7; font-weight: bold; }
+        input[type=text] { padding: 9px; border-radius: 6px;
+                           border: 1px solid #0f3460; background: #0d1b2a;
+                           color: #eee; width: 180px; }
+        table { width: 100%; border-collapse: collapse;
+                font-size: 0.88em; margin-top: 10px; }
+        th { text-align: left; color: #4fc3f7; padding: 6px 4px;
+             border-bottom: 1px solid #0f3460; }
+        td { padding: 8px 4px; border-bottom: 1px solid #0f3460; }
+        td.mono { font-family: monospace; font-size: 0.95em; }
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr;
+                  gap: 8px; }
+        .dpad { display: grid; grid-template-columns: repeat(3, 1fr);
+                gap: 8px; max-width: 260px; }
+        .dpad button { padding: 14px; }
+        .dpad .empty { visibility: hidden; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>MedPal Control Panel</h1>
+
+    <div class="video-wrap">
+        <img src="/video_feed" id="video" alt="live feed">
+    </div>
+
+    <div class="panel">
+        <h2>Status</h2>
+        <div class="status-box">
+            Mode: <span id="s-mode">idle</span> &nbsp;|&nbsp;
+            Following: <span id="s-follow">none</span> &nbsp;|&nbsp;
+            Servo: <span id="s-servo">closed</span>
+        </div>
+    </div>
+
+    <div class="panel">
+        <h2>Manual Drive</h2>
+        <div class="dpad">
+            <div class="empty"></div>
+            <button class="btn-primary" onclick="cmd('forward')">▲</button>
+            <div class="empty"></div>
+            <button class="btn-primary" onclick="cmd('left')">◄</button>
+            <button class="btn-danger" onclick="cmd('stop')">■</button>
+            <button class="btn-primary" onclick="cmd('right')">►</button>
+            <div class="empty"></div>
+            <button class="btn-primary" onclick="cmd('backward')">▼</button>
+            <div class="empty"></div>
+        </div>
+    </div>
+
+    <div class="panel">
+        <h2>Medication Dispenser</h2>
+        <div class="btn-row">
+            <button class="btn-success" onclick="servo('open')">Open</button>
+            <button class="btn-danger"  onclick="servo('close')">Close</button>
+            <button class="btn-primary" onclick="servo('toggle')">Toggle</button>
+        </div>
+    </div>
+
+    <div class="panel">
+        <h2>Register New Person</h2>
+        <div class="btn-row">
+            <input type="text" id="enroll-name" placeholder="Person name">
+            <button class="btn-primary" onclick="enroll()">Capture Face</button>
+            <button class="btn-success" onclick="train()">Retrain Now</button>
+        </div>
+        <div class="status-box" id="enroll-status">
+            Enter a name and click Capture Face.
+        </div>
+    </div>
+
+    <div class="panel">
+        <h2>Follow Target</h2>
+        <div class="btn-row" id="people-list"></div>
+    </div>
+
+    <div class="panel">
+        <h2>RFID Cards</h2>
+        <div class="btn-row">
+            <input type="text" id="rfid-person" placeholder="Person name">
+            <button class="btn-primary" onclick="rfidEnroll()">Enroll Card</button>
+            <button class="btn-danger"  onclick="rfidCancel()">Cancel</button>
+        </div>
+        <div class="status-box" id="rfid-status">
+            No enrollment in progress.
+        </div>
+        <table>
+            <thead>
+                <tr><th>UID</th><th>Person</th>
+                    <th>Auth</th><th></th></tr>
+            </thead>
+            <tbody id="rfid-tbody"></tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+    // ---- API helpers ----
+    const api = (path, body) => fetch(path, {
+        method: body ? 'POST' : 'GET',
+        headers: body ? {'Content-Type': 'application/json'} : {},
+        body: body ? JSON.stringify(body) : undefined
+    }).then(r => r.json());
+
+    // ---- Motor ----
+    function cmd(c) { api('/api/command', {command: c}); }
+
+    // ---- Servo ----
+    function servo(a) { api('/api/servo', {action: a}); }
+
+    // ---- Enroll ----
+    function enroll() {
+        const name = document.getElementById('enroll-name').value.trim();
+        if (!name) return alert('Enter a name first.');
+        document.getElementById('enroll-status').textContent =
+            'Capturing crops for ' + name + '... look at the camera.';
+        api('/api/enroll', {name, samples: 30})
+            .then(d => {
+                if (d.status === 'started')
+                    document.getElementById('enroll-status').textContent =
+                        'Capturing ' + d.samples + ' crops for ' + d.name +
+                        '. Watch the video.';
+                else
+                    alert('Error: ' + d.msg);
+            });
+    }
+
+    function train() {
+    document.getElementById('enroll-status').textContent =
+        'Training classifier...';
+    api('/api/train', {}).then(d => {
+        if (d && d.status === 'error') {
+            document.getElementById('enroll-status').textContent =
+                'Error: ' + d.msg;
+        } else {
+            document.getElementById('enroll-status').textContent =
+                'Training started. Watch the terminal for [train] lines.';
+        }
+    });
+}
+
+    // ---- Follow ----
+    function follow(name) { api('/api/follow', {name}); }
+
+    // ---- RFID ----
+    function rfidEnroll() {
+        const person = document.getElementById('rfid-person').value.trim();
+        if (!person) return alert('Enter the person name first.');
+        api('/api/rfid/enroll/start', {person}).then(d => {
+            if (d.status === 'ok')
+                document.getElementById('rfid-status').textContent =
+                    'Waiting for card scan (up to ' + d.timeout_s +
+                    's). Tap the card on the reader.';
+            else
+                alert('Error: ' + d.msg);
+        });
+    }
+
+    function rfidCancel() {
+        api('/api/rfid/enroll/cancel').then(() => {
+            document.getElementById('rfid-status').textContent =
+                'Enrollment cancelled.';
+        });
+    }
+
+    function rfidRemove(uid) {
+        if (!confirm('Remove UID ' + uid + '?')) return;
+        api('/api/rfid/remove', {uid}).then(() => refresh());
+    }
+
+    function renderRfid(items, pending) {
+        const tbody = document.getElementById('rfid-tbody');
+        tbody.innerHTML = '';
+        items.forEach(item => {
+            const tr = document.createElement('tr');
+
+            const tdUid = document.createElement('td');
+            tdUid.className = 'mono';
+            tdUid.textContent = item.uid;
+
+            const tdPerson = document.createElement('td');
+            tdPerson.textContent = item.person || '—';
+
+            const tdAuth = document.createElement('td');
+            tdAuth.textContent = item.authorized ? '✓' : '—';
+            tdAuth.style.color = item.authorized ? '#4fc3f7' : '#888';
+
+            const tdAct = document.createElement('td');
+            const btn = document.createElement('button');
+            btn.className = 'btn-danger';
+            btn.textContent = 'Remove';
+            btn.style.padding = '4px 10px';
+            btn.style.fontSize = '0.85em';
+            btn.onclick = () => rfidRemove(item.uid);
+            tdAct.appendChild(btn);
+
+            tr.append(tdUid, tdPerson, tdAuth, tdAct);
+            tbody.appendChild(tr);
+        });
+
+        const status = document.getElementById('rfid-status');
+        if (pending) {
+            status.textContent =
+                'Waiting for card for "' + pending + '"...';
+        }
+    }
+
+    // ---- Poll ----
+    function refresh() {
+        // Status
+        fetch('/api/status').then(r => r.json()).then(d => {
+            document.getElementById('s-mode').textContent = d.mode;
+            document.getElementById('s-follow').textContent =
+                d.follow_name || 'none';
+            document.getElementById('s-servo').textContent =
+                d.servo_open ? 'OPEN' : 'closed';
+
+            const list = document.getElementById('people-list');
+            list.innerHTML = '';
+            d.people.forEach(p => {
+                const b = document.createElement('button');
+                b.className = 'btn-primary';
+                b.textContent = p;
+                b.onclick = () => follow(p);
+                list.appendChild(b);
+            });
+        });
+
+        // RFID
+        fetch('/api/rfid/list').then(r => r.json()).then(d => {
+            renderRfid(d.items, d.pending);
+        });
+    }
+    setInterval(refresh, 2000);
+    refresh();
+
+    // ---- Keyboard shortcuts ----
+    document.addEventListener('keydown', e => {
+        const map = {
+            'ArrowUp': 'forward', 'ArrowDown': 'backward',
+            'ArrowLeft': 'left', 'ArrowRight': 'right',
+            ' ': 'stop'
+        };
+        if (map[e.key]) {
+            e.preventDefault();
+            cmd(map[e.key]);
+        }
+    });
+</script>
+</body>
+</html>
