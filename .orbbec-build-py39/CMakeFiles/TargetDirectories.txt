@@ -1,0 +1,9 @@
+/home/medpal/2026medpal/.orbbec-build-py39/CMakeFiles/pyorbbecsdk.dir
+/home/medpal/2026medpal/.orbbec-build-py39/CMakeFiles/uninstall.dir
+/home/medpal/2026medpal/.orbbec-build-py39/CMakeFiles/test.dir
+/home/medpal/2026medpal/.orbbec-build-py39/CMakeFiles/edit_cache.dir
+/home/medpal/2026medpal/.orbbec-build-py39/CMakeFiles/rebuild_cache.dir
+/home/medpal/2026medpal/.orbbec-build-py39/CMakeFiles/list_install_components.dir
+/home/medpal/2026medpal/.orbbec-build-py39/CMakeFiles/install.dir
+/home/medpal/2026medpal/.orbbec-build-py39/CMakeFiles/install/local.dir
+/home/medpal/2026medpal/.orbbec-build-py39/CMakeFiles/install/strip.dir

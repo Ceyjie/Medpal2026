@@ -5,9 +5,10 @@
     <title>MedPal Control</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        * { box-sizing: border-box; }
+        * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
         body { font-family: sans-serif; background: #1a1a2e; color: #eee;
-               margin: 0; padding: 16px; }
+               margin: 0; padding: 16px;
+               user-select: none; -webkit-user-select: none; }
         h1 { color: #4fc3f7; font-size: 1.4em; margin: 0 0 12px; }
         h2 { color: #4fc3f7; font-size: 1em; margin: 0 0 10px; }
         .container { max-width: 720px; margin: 0 auto; }
@@ -17,7 +18,8 @@
                  padding: 14px; margin: 14px 0; }
         .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
         button { padding: 10px 16px; border: none; border-radius: 6px;
-                 cursor: pointer; font-size: 0.95em; font-weight: 500; }
+                 cursor: pointer; font-size: 0.95em; font-weight: 500;
+                 touch-action: none; }
         .btn-primary { background: #0f3460; color: #fff; }
         .btn-primary:hover { background: #1a5276; }
         .btn-danger  { background: #e94560; color: #fff; }
@@ -37,12 +39,50 @@
              border-bottom: 1px solid #0f3460; }
         td { padding: 8px 4px; border-bottom: 1px solid #0f3460; }
         td.mono { font-family: monospace; font-size: 0.95em; }
-        .grid-2 { display: grid; grid-template-columns: 1fr 1fr;
-                  gap: 8px; }
-        .dpad { display: grid; grid-template-columns: repeat(3, 1fr);
-                gap: 8px; max-width: 260px; }
-        .dpad button { padding: 14px; }
+
+        /* D-pad: 3x3 grid, min 64px buttons */
+        .dpad { display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                grid-template-rows: repeat(3, 1fr);
+                gap: 8px;
+                max-width: 300px;
+                margin: 0 auto; }
+        .dpad button {
+            padding: 16px 0;
+            font-size: 1.5em;
+            min-height: 64px;
+            border-radius: 10px;
+            background: #0f3460;
+            color: #fff;
+            border: 2px solid #1a5276;
+            transition: background 0.08s;
+        }
+        .dpad button:active,
+        .dpad button.held {
+            background: #4fc3f7;
+            color: #000;
+            border-color: #fff;
+        }
+        .dpad .stop-btn {
+            background: #e94560;
+            border-color: #c73650;
+            font-size: 1.2em;
+        }
+        .dpad .stop-btn:active {
+            background: #ff6b85;
+        }
         .dpad .empty { visibility: hidden; }
+
+        #drive-status {
+            text-align: center;
+            font-size: 0.85em;
+            margin-top: 12px;
+            padding: 6px;
+            border-radius: 6px;
+            background: #0d1b2a;
+            color: #888;
+            font-family: monospace;
+        }
     </style>
 </head>
 <body>
@@ -58,23 +98,25 @@
         <div class="status-box">
             Mode: <span id="s-mode">idle</span> &nbsp;|&nbsp;
             Following: <span id="s-follow">none</span> &nbsp;|&nbsp;
+            Locked: <span id="s-locked">no</span> &nbsp;|&nbsp;
             Servo: <span id="s-servo">closed</span>
         </div>
     </div>
 
     <div class="panel">
-        <h2>Manual Drive</h2>
+        <h2>Manual Drive (hold to move)</h2>
         <div class="dpad">
             <div class="empty"></div>
-            <button class="btn-primary" onclick="cmd('forward')">▲</button>
+            <button class="dp-btn" data-cmd="forward">▲</button>
             <div class="empty"></div>
-            <button class="btn-primary" onclick="cmd('left')">◄</button>
-            <button class="btn-danger" onclick="cmd('stop')">■</button>
-            <button class="btn-primary" onclick="cmd('right')">►</button>
+            <button class="dp-btn" data-cmd="left">◄</button>
+            <button class="dp-btn stop-btn" data-cmd="stop">■</button>
+            <button class="dp-btn" data-cmd="right">►</button>
             <div class="empty"></div>
-            <button class="btn-primary" onclick="cmd('backward')">▼</button>
+            <button class="dp-btn" data-cmd="backward">▼</button>
             <div class="empty"></div>
         </div>
+        <div id="drive-status">Idle — hold a button to move</div>
     </div>
 
     <div class="panel">
@@ -83,6 +125,10 @@
             <button class="btn-success" onclick="servo('open')">Open</button>
             <button class="btn-danger"  onclick="servo('close')">Close</button>
             <button class="btn-primary" onclick="servo('toggle')">Toggle</button>
+        </div>
+        <div class="status-box" style="font-size:0.85em;">
+            Touch sensor also toggles the dispenser, but only when the
+            follow target is recognized and locked.
         </div>
     </div>
 
@@ -126,13 +172,128 @@
 <script>
     // ---- API helpers ----
     const api = (path, body) => fetch(path, {
-        method: body ? 'POST' : 'GET',
-        headers: body ? {'Content-Type': 'application/json'} : {},
-        body: body ? JSON.stringify(body) : undefined
+        method: body !== undefined ? 'POST' : 'GET',
+        headers: body !== undefined ? {'Content-Type': 'application/json'} : {},
+        body: body !== undefined ? JSON.stringify(body) : undefined
     }).then(r => r.json());
 
-    // ---- Motor ----
-    function cmd(c) { api('/api/command', {command: c}); }
+    // ---- Hold-to-move D-pad ----
+    (function () {
+        const HOLD_INTERVAL_MS = 200;
+        const STALE_MS = 500;
+
+        const statusEl = document.getElementById('drive-status');
+        let active_cmd = null;
+        let hold_timer = null;
+
+        function setStatus(text, color) {
+            statusEl.textContent = text;
+            statusEl.style.color = color || '#888';
+        }
+
+        async function sendCommand(cmd) {
+            try {
+                await fetch('/api/command', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({command: cmd})
+                });
+            } catch (e) { /* ignore */ }
+        }
+
+        function startHold(cmd, btn) {
+            if (active_cmd === cmd) return;
+            stopHold();
+            active_cmd = cmd;
+            btn.classList.add('held');
+            setStatus('Moving: ' + cmd, '#4fc3f7');
+            sendCommand(cmd);
+            hold_timer = setInterval(
+                () => sendCommand(cmd), HOLD_INTERVAL_MS);
+        }
+
+        function stopHold() {
+            if (hold_timer) {
+                clearInterval(hold_timer);
+                hold_timer = null;
+            }
+            if (active_cmd) {
+                sendCommand('stop');
+                active_cmd = null;
+            }
+            document.querySelectorAll('.dp-btn.held').forEach(
+                b => b.classList.remove('held'));
+            setStatus('Idle', '#888');
+        }
+
+        document.querySelectorAll('.dp-btn').forEach(btn => {
+            const cmd = btn.getAttribute('data-cmd');
+            if (cmd === 'stop') {
+                btn.addEventListener('pointerdown', e => {
+                    e.preventDefault();
+                    stopHold();
+                    sendCommand('stop');
+                    setStatus('Stopped', '#e94560');
+                });
+                return;
+            }
+            btn.addEventListener('pointerdown', e => {
+                e.preventDefault();
+                btn.setPointerCapture(e.pointerId);
+                startHold(cmd, btn);
+            });
+            const release = e => {
+                e.preventDefault();
+                stopHold();
+            };
+            btn.addEventListener('pointerup', release);
+            btn.addEventListener('pointercancel', release);
+            btn.addEventListener('lostpointercapture', release);
+            // Also handle if the user drags off the button
+            btn.addEventListener('pointerleave', e => {
+                // Don't stop on pointerleave if pointer capture
+                // is active — the release event will fire.
+            });
+        });
+
+        // Safety: stop if the window loses focus mid-hold
+        window.addEventListener('blur', stopHold);
+        window.addEventListener('pagehide', stopHold);
+        window.addEventListener('beforeunload', stopHold);
+
+        // Keyboard: arrow keys + space
+        const keyMap = {
+            'ArrowUp': 'forward', 'ArrowDown': 'backward',
+            'ArrowLeft': 'left', 'ArrowRight': 'right',
+            ' ': 'stop'
+        };
+        let keyHeld = null;
+        document.addEventListener('keydown', e => {
+            const cmd = keyMap[e.key];
+            if (!cmd) return;
+            e.preventDefault();
+            if (cmd === 'stop') {
+                stopHold();
+                sendCommand('stop');
+                setStatus('Stopped', '#e94560');
+                return;
+            }
+            if (keyHeld === cmd) return;
+            keyHeld = cmd;
+            const btn = document.querySelector(
+                `.dp-btn[data-cmd="${cmd}"]`);
+            if (btn) startHold(cmd, btn);
+        });
+        document.addEventListener('keyup', e => {
+            const cmd = keyMap[e.key];
+            if (!cmd || cmd === 'stop') return;
+            e.preventDefault();
+            if (keyHeld === cmd) {
+                keyHeld = null;
+                stopHold();
+            }
+        });
+    })();
 
     // ---- Servo ----
     function servo(a) { api('/api/servo', {action: a}); }
@@ -154,19 +315,22 @@
             });
     }
 
-    function train() {
-    document.getElementById('enroll-status').textContent =
-        'Training classifier...';
-    api('/api/train', {}).then(d => {
-        if (d && d.status === 'error') {
+        function train() {
+        document.getElementById('enroll-status').textContent =
+            'Training classifier...';
+        api('/api/train', {}).then(d => {
+            if (d && d.status === 'error') {
+                document.getElementById('enroll-status').textContent =
+                    'Error: ' + d.msg;
+            } else {
+                document.getElementById('enroll-status').textContent =
+                    'Training started. Watch the terminal for [train] lines.';
+            }
+        }).catch(err => {
             document.getElementById('enroll-status').textContent =
-                'Error: ' + d.msg;
-        } else {
-            document.getElementById('enroll-status').textContent =
-                'Training started. Watch the terminal for [train] lines.';
-        }
-    });
-}
+                'Network error: ' + err;
+        });
+    }
 
     // ---- Follow ----
     function follow(name) { api('/api/follow', {name}); }
@@ -202,18 +366,14 @@
         tbody.innerHTML = '';
         items.forEach(item => {
             const tr = document.createElement('tr');
-
             const tdUid = document.createElement('td');
             tdUid.className = 'mono';
             tdUid.textContent = item.uid;
-
             const tdPerson = document.createElement('td');
             tdPerson.textContent = item.person || '—';
-
             const tdAuth = document.createElement('td');
             tdAuth.textContent = item.authorized ? '✓' : '—';
             tdAuth.style.color = item.authorized ? '#4fc3f7' : '#888';
-
             const tdAct = document.createElement('td');
             const btn = document.createElement('button');
             btn.className = 'btn-danger';
@@ -222,11 +382,9 @@
             btn.style.fontSize = '0.85em';
             btn.onclick = () => rfidRemove(item.uid);
             tdAct.appendChild(btn);
-
             tr.append(tdUid, tdPerson, tdAuth, tdAct);
             tbody.appendChild(tr);
         });
-
         const status = document.getElementById('rfid-status');
         if (pending) {
             status.textContent =
@@ -236,11 +394,12 @@
 
     // ---- Poll ----
     function refresh() {
-        // Status
         fetch('/api/status').then(r => r.json()).then(d => {
             document.getElementById('s-mode').textContent = d.mode;
             document.getElementById('s-follow').textContent =
                 d.follow_name || 'none';
+            document.getElementById('s-locked').textContent =
+                d.locked ? 'yes' : 'no';
             document.getElementById('s-servo').textContent =
                 d.servo_open ? 'OPEN' : 'closed';
 
@@ -253,28 +412,19 @@
                 b.onclick = () => follow(p);
                 list.appendChild(b);
             });
-        });
 
-        // RFID
+            if (d.enroll_name) {
+                document.getElementById('enroll-status').textContent =
+                    `Enrolling "${d.enroll_name}": ` +
+                    `${d.enroll_captured}/${d.enroll_target}`;
+            }
+        });
         fetch('/api/rfid/list').then(r => r.json()).then(d => {
             renderRfid(d.items, d.pending);
         });
     }
     setInterval(refresh, 2000);
     refresh();
-
-    // ---- Keyboard shortcuts ----
-    document.addEventListener('keydown', e => {
-        const map = {
-            'ArrowUp': 'forward', 'ArrowDown': 'backward',
-            'ArrowLeft': 'left', 'ArrowRight': 'right',
-            ' ': 'stop'
-        };
-        if (map[e.key]) {
-            e.preventDefault();
-            cmd(map[e.key]);
-        }
-    });
 </script>
 </body>
 </html>

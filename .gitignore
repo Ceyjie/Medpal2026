@@ -1,60 +1,20 @@
-# Python
 __pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
-
-# Venvs
+*.pyc
+*.pyo
 coral_venv/
 venv/
 .venv/
-
-# Models and binaries
-*.tflite
-*.onnx
-*.pth
-*.whl
-
-# Private / trained data
-*.pkl
-face_training/
-tracking_person/
-rfid_persons.json
-authorized_uids.txt
-targets/
-githubpass
-.env
-
-# Device-specific
-camera_calib.yml
-
-# Runtime junk
-*.log
 *.jpg
 *.jpeg
 *.png
-*.npy
-Log/
-core.*
-frames_*.gv
-frames_*.pdf
-scan_snapshot.yaml
-
-# Build artifacts
-.orbbec-build*/
-ros2_bridge/
-ros2-docker.sh
-Dockerfile
-get-docker.sh
-
-# Nested repos
-Mobilefacenet-TF2-coral_tpu/
-
-# Backup files
-*Orig.py
-
-# Editor / OS
+!docs/**/*.png
+face_training/
+models/
+*.tflite
+*.onnx
+*.pt
+*.pkl
+camera_calib.yml
 .DS_Store
-.vscode/
-.idea/
-*.swp
+*.log
+__MACOSX/
